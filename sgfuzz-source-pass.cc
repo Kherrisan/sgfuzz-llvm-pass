@@ -59,8 +59,29 @@ using namespace llvm;
 using namespace std;
 namespace fs = std::filesystem;
 
+string getDITypeString(DIType *ty);
+
 static bool checkedEnv = false;
 static const char *cachedEnv = nullptr;
+
+const char *getCachedEnv(const char *varName)
+{
+    if (!checkedEnv)
+    {
+        cachedEnv = getenv(varName);
+        checkedEnv = true;
+    }
+    return cachedEnv;
+}
+
+#define ENV_DEBUG(expr)                                     \
+    do                                                      \
+    {                                                       \
+        if (const char *env = getCachedEnv("SGFUZZ_DEBUG")) \
+        {                                                   \
+            expr;                                           \
+        }                                                   \
+    } while (0)
 
 DIDerivedType *findFirstOffsetDIType(DICompositeType *CT, int offset = 0)
 {
@@ -81,6 +102,7 @@ DIDerivedType *findFirstOffsetDIType(DICompositeType *CT, int offset = 0)
                 }
                 else
                 {
+                    ENV_DEBUG(dbgs() << "findFirstOffsetDIType: " << getDITypeString(derived) << "\n");
                     return derived;
                 }
             }
@@ -106,25 +128,6 @@ bool lastFieldIsPaddingField(Type *ty)
     }
     return false;
 }
-
-const char *getCachedEnv(const char *varName)
-{
-    if (!checkedEnv)
-    {
-        cachedEnv = getenv(varName);
-        checkedEnv = true;
-    }
-    return cachedEnv;
-}
-
-#define ENV_DEBUG(expr)                                     \
-    do                                                      \
-    {                                                       \
-        if (const char *env = getCachedEnv("SGFUZZ_DEBUG")) \
-        {                                                   \
-            expr;                                           \
-        }                                                   \
-    } while (0)
 
 enum InstrumentType
 {
@@ -717,73 +720,6 @@ struct VarTypeInfo
         }
         return name;
     }
-
-    static VarTypeInfo fromTypeAndDIType(Type *ty, DIType *diType = nullptr)
-    {
-        ENV_DEBUG(dbgs() << "fromType: " << *ty << ", DIType: " << getDITypeString(diType) << "\n");
-        if (!ty)
-        {
-            ENV_DEBUG(dbgs() << "fromType: nullptr\n");
-            return VarTypeInfo();
-        }
-
-        assert(!ty->isPointerTy());
-        VarTypeInfo info;
-
-        if (ty->isFloatingPointTy())
-        {
-            info.kind = Kind::Float;
-            info.info.bits = ty->getScalarSizeInBits();
-        }
-        else if (ty->isIntegerTy())
-        {
-            info.kind = Kind::Int;
-            info.info.bits = ty->getIntegerBitWidth();
-        }
-        else if (ty->isStructTy())
-        {
-            info.kind = Kind::Struct;
-            info.info.struct_type.name = pruneStructName(ty->getStructName().str());
-        }
-        else if (ty->isArrayTy())
-        {
-            info.kind = Kind::Array;
-            info.info.array.length = ty->getArrayNumElements();
-            info.info.array.elem_type = std::make_unique<VarTypeInfo>();
-            if (ty->getArrayElementType()->isPointerTy())
-            {
-                info.info.array.elem_type->kind = VarTypeInfo::Kind::Pointer;
-            }
-            else if (ty->getArrayElementType()->isStructTy())
-            {
-                DIType *elementDIType = nullptr;
-                if (auto *CT = dyn_cast<DICompositeType>(diType))
-                {
-                    elementDIType = CT->getBaseType();
-                }
-                else
-                {
-                    elementDIType = diType;
-                }
-                DIType *prunedDIType = pruneTypedef(elementDIType);
-                auto elementTypeInfo = fromTypeAndDIType(ty->getArrayElementType(), prunedDIType);
-                info.info.array.elem_type = std::make_unique<VarTypeInfo>(elementTypeInfo);
-            }
-        }
-        else if (ty->isVoidTy())
-        {
-            info.kind = Kind::Other;
-            info.info.other.name = "void";
-        }
-        else
-        {
-            ENV_DEBUG(dbgs() << "fromType: unknown type: " << *ty << "\n");
-            info.kind = Kind::Other;
-            info.info.other.name = "unknown";
-        }
-
-        return info;
-    }
 };
 
 void collectDICompositeTypes(DIType *Type, set<DIType *> &visited, map<string, DIType *> &map);
@@ -864,16 +800,98 @@ private:
 
     std::map<std::string, DIType *> structDITypes;
 
-    std::map<string, vector<DIType *>> structFieldDITypeMapping;
+    std::map<string, std::map<int, DIType *>> structFieldDITypeMapping;
 
 public:
     VarTypeInfo resolveVarTypeFromDIType(DIType *type);
+
+    VarTypeInfo fromTypeAndDIType(Type *ty, DIType *diType = nullptr)
+    {
+        ENV_DEBUG(dbgs() << "fromType: " << *ty << ", DIType: " << getDITypeString(diType) << "\n");
+        if (!ty)
+        {
+            ENV_DEBUG(dbgs() << "fromType: nullptr\n");
+            return VarTypeInfo();
+        }
+
+        assert(!ty->isPointerTy() || diType);
+        if (ty->isPointerTy())
+        {
+            return resolveVarTypeFromDIType(diType);
+        }
+
+        VarTypeInfo info;
+
+        if (ty->isFloatingPointTy())
+        {
+            info.kind = VarTypeInfo::Kind::Float;
+            info.info.bits = ty->getScalarSizeInBits();
+        }
+        else if (ty->isIntegerTy())
+        {
+            info.kind = VarTypeInfo::Kind::Int;
+            info.info.bits = ty->getIntegerBitWidth();
+        }
+        else if (ty->isStructTy())
+        {
+            info.kind = VarTypeInfo::Kind::Struct;
+            info.info.struct_type.name = pruneStructName(ty->getStructName().str());
+        }
+        else if (ty->isArrayTy())
+        {
+            info.kind = VarTypeInfo::Kind::Array;
+            info.info.array.length = ty->getArrayNumElements();
+            info.info.array.elem_type = std::make_unique<VarTypeInfo>();
+            if (ty->getArrayElementType()->isPointerTy())
+            {
+                info.info.array.elem_type->kind = VarTypeInfo::Kind::Pointer;
+            }
+            else if (ty->getArrayElementType()->isStructTy())
+            {
+                DIType *elementDIType = nullptr;
+                if (auto *CT = dyn_cast<DICompositeType>(diType))
+                {
+                    elementDIType = CT->getBaseType();
+                }
+                else
+                {
+                    elementDIType = diType;
+                }
+                DIType *prunedDIType = pruneTypedef(elementDIType);
+                auto elementTypeInfo = fromTypeAndDIType(ty->getArrayElementType(), prunedDIType);
+                info.info.array.elem_type = std::make_unique<VarTypeInfo>(elementTypeInfo);
+            }
+            else
+            {
+                auto elementTypeInfo = fromTypeAndDIType(ty->getArrayElementType());
+                info.info.array.elem_type = std::make_unique<VarTypeInfo>(elementTypeInfo);
+            }
+        }
+        else if (ty->isVoidTy())
+        {
+            info.kind = VarTypeInfo::Kind::Other;
+            info.info.other.name = "void";
+        }
+        else
+        {
+            ENV_DEBUG(dbgs() << "fromType: unknown type: " << *ty << "\n");
+            info.kind = VarTypeInfo::Kind::Other;
+            info.info.other.name = "unknown";
+        }
+
+        return info;
+    }
 
     std::optional<VarInfo> interpret(Module *M, Type *type, VarInfo var)
     {
         // type can only be primitive type or vector type (<2 x i32>)
         assert(!type->isStructTy() && "type must not be a struct type");
         assert(!type->isArrayTy() && "type must not be an array type");
+
+        if (type->isPointerTy())
+        {
+            return var;
+        }
 
         if (!var.DIType)
         {
@@ -915,11 +933,11 @@ public:
         {
             DIType *fieldDIType = nullptr;
             fieldDIType = resolveStructFieldDIType(M, type, addressDIType, 0);
-            ENV_DEBUG(errs() << "interpret resolveStructFieldDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
+            ENV_DEBUG(dbgs() << "interpret resolveStructFieldDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
             if (!fieldDIType)
             {
                 fieldDIType = findFirstOffsetDIType(dyn_cast<DICompositeType>(addressDIType), 0);
-                ENV_DEBUG(errs() << "interpret findFirstOffsetDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
+                ENV_DEBUG(dbgs() << "interpret findFirstOffsetDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
             }
             if (!fieldDIType)
             {
@@ -1194,13 +1212,29 @@ public:
         return true;
     }
 
-    DIType *resolveStructFieldDIType(Module *M, Type *type, DIType *structDIType, int fieldIndex)
+    /**
+     * GEP [n x i32], ptr %1, i32 0, i32 1
+     * while %1 DIType could be struct or array
+     */
+    DIType *resolveArrayFieldDIType(Module *M, Type *type, DIType *arrayDIType, int fieldIndex)
     {
-        if (!type->isStructTy())
+        if (!type->isArrayTy() && !type->isPointerTy())
         {
             return nullptr;
         }
-        string mappingKey = typeName(type) + "-" + DITypeName(structDIType);
+        if (!arrayDIType)
+        {
+            return nullptr;
+        }
+        if (!dyn_cast<DICompositeType>(arrayDIType))
+        {
+            return nullptr;
+        }
+        if (type->isPointerTy())
+        {
+            return dyn_cast<DICompositeType>(arrayDIType)->getBaseType();
+        }
+        string mappingKey = typeName(type) + "-" + DITypeName(arrayDIType);
         if (structFieldDITypeMapping.find(mappingKey) != structFieldDITypeMapping.end())
         {
             if (fieldIndex < structFieldDITypeMapping[mappingKey].size())
@@ -1212,15 +1246,141 @@ public:
                 return nullptr;
             }
         }
+        auto arrayElemType = type->getArrayElementType();
+        if (arrayDIType->getTag() == dwarf::DW_TAG_array_type)
+        {
+            // %1 is array type
+            auto arrayElemDIType = dyn_cast<DICompositeType>(arrayDIType)->getBaseType();
+            arrayElemDIType = pruneTypedef(arrayElemDIType);
+            if (auto CT = dyn_cast<DICompositeType>(arrayElemDIType))
+            {
+                // %1 is an array of a struct type
+                // case 1: %1's element type is exactly the same as the struct type
+                // case 2: %1's element type is not matched, but its first field may be matched
+                if (typeCompatible(M, arrayElemType, CT))
+                {
+                    return arrayElemDIType;
+                }
+                else
+                {
+                    auto firstFieldDIType = findFirstOffsetDIType(CT, 0);
+                    if (firstFieldDIType)
+                    {
+                        return resolveArrayFieldDIType(M, type, firstFieldDIType, fieldIndex);
+                    }
+                }
+            }
+            else
+            {
+                // %1 is an array of a primitive type
+                if (primitiveTypeCompatible(arrayElemType, arrayElemDIType))
+                {
+                    return arrayElemDIType;
+                }
+            }
+        }
+        else if (arrayDIType->getTag() == dwarf::DW_TAG_structure_type || arrayDIType->getTag() == dwarf::DW_TAG_class_type)
+        {
+            // %1 is struct type, then its type is not matched, but its first field may be matched
+            auto CT = dyn_cast<DICompositeType>(arrayDIType);
+            auto firstFieldDIType = findFirstOffsetDIType(CT, 0);
+            if (firstFieldDIType)
+            {
+                return resolveArrayFieldDIType(M, type, firstFieldDIType, fieldIndex);
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * GEP %struct.S, ptr %s, i32 0, i32 1
+     * while %s DIType could be struct or array
+     */
+    DIType *resolveStructFieldDIType(Module *M, Type *type, DIType *structDIType, int fieldIndex, string mappingKey = "")
+    {
+        if (!structDIType)
+        {
+            return nullptr;
+        }
+        if (!dyn_cast<DICompositeType>(structDIType))
+        {
+            return nullptr;
+        }
+        if (!type->isStructTy() && !type->isPointerTy())
+        {
+            return nullptr;
+        }
+        ENV_DEBUG(dbgs() << "resolveStructFieldDIType: " << typeName(type) << ", " << DITypeName(structDIType) << ", " << fieldIndex << "\n");
+        if (mappingKey.empty())
+        {
+            mappingKey = typeName(type) + "-" + DITypeName(structDIType);
+        }
+        // if (structFieldDITypeMapping.find(mappingKey) != structFieldDITypeMapping.end())
+        // {
+        //     if (structFieldDITypeMapping[mappingKey].find(fieldIndex) != structFieldDITypeMapping[mappingKey].end())
+        //     {
+        //         return structFieldDITypeMapping[mappingKey][fieldIndex];
+        //     }
+        // }
+        if (structDIType->getTag() == dwarf::DW_TAG_array_type)
+        {
+            // structDIType is array type, but type is a struct type
+            // try to find the fieldIndex-th element in the array's first element as a struct type
+            auto arrayElemDIType = dyn_cast<DICompositeType>(structDIType)->getBaseType();
+            arrayElemDIType = pruneTypedef(arrayElemDIType);
+            return resolveStructFieldDIType(M, type, arrayElemDIType, fieldIndex);
+        }
+        if (type->isPointerTy())
+        {
+            auto elements = dyn_cast<DICompositeType>(structDIType)->getElements();
+            int i = 0;
+            for (; i < elements.size() && fieldIndex > 0; i++)
+            {
+                if (auto derived = dyn_cast<DIDerivedType>(elements[i]))
+                {
+                    if (derived->getFlags() & DIType::DIFlags::FlagVirtual || derived->getName().find("_vptr$") == 0)
+                    {
+                        continue;
+                    }
+                    if (i > 0)
+                    {
+                        auto lastDerived = dyn_cast<DIDerivedType>(elements[i - 1]);
+                        if (derived->getOffsetInBits() != lastDerived->getOffsetInBits())
+                        {
+                            fieldIndex--;
+                        }
+                    }
+                    else
+                    {
+                        fieldIndex--;
+                    }
+                }
+            }
+            return dyn_cast<DIType>(dyn_cast<DICompositeType>(structDIType)->getElements()[i]);
+        }
         // Construct the mapping
         DataLayout DL(M);
         const StructLayout *SL = DL.getStructLayout(dyn_cast<StructType>(type));
         int diElemIndex = 0;
         int layoutIndex = 0;
         auto elements = dyn_cast<DICompositeType>(structDIType)->getElements();
-        vector<DIType *> fieldDITypes;
+        if (elements.size() == 0)
+        {
+            DIType *defDIType = structDITypes[structDIType->getName().str()];
+            if (defDIType)
+            {
+                elements = dyn_cast<DICompositeType>(defDIType)->getElements();
+            }
+            else
+            {
+                dbgs() << "[!] sgfuzz-source-pass: cannot find full definition, only forward declaration for type: " << structDIType->getName().str() << "\n";
+                return nullptr;
+            }
+        }
+        std::map<int, DIType *> fieldDITypes;
         // match the fields defined in StructType object and DICompositeType
         // StructType may contain padding object, merge multiple bitfield into one field element
+        vector<bool> isPadding;
         while (diElemIndex < elements.size() && layoutIndex < type->getStructNumElements())
         {
             uint64_t layoutOffset = SL->getElementOffset(layoutIndex);
@@ -1228,23 +1388,22 @@ public:
             if (auto derived = dyn_cast<DIDerivedType>(elements[diElemIndex]))
             {
                 ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << ", offset: " << derived->getOffsetInBits() << "\n");
-                if (derived->isBitField() || (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember))
+                if (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember)
+                {
+                    diElemIndex++;
+                    continue;
+                }
+                if (derived->isBitField())
                 {
                     diElemIndex++;
                 }
                 else if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
                 {
-                    fieldDITypes.push_back(derived);
+                    fieldDITypes[fieldDITypes.size()] = derived;
+                    isPadding.push_back(false);
                     diElemIndex++;
                     layoutIndex++;
                 }
-                // else if (auto *baseCT = dyn_cast<DICompositeType>(derived->getBaseType()))
-                // {
-                //     if (derived->getTag() == llvm::dwarf::DW_TAG_array_type)
-                //     {
-
-                //     }
-                // }
                 else if (derived->getTag() == llvm::dwarf::DW_TAG_inheritance)
                 {
                     DICompositeType *baseCT = dyn_cast<DICompositeType>(derived->getBaseType());
@@ -1253,22 +1412,25 @@ public:
                         // virtual inheritance
                         diElemIndex++;
                     }
-                    else if (derived->getOffsetInBits() == layoutOffset * 8 && typeCompatible(M, type->getStructElementType(layoutIndex), baseCT, diElemIndex))
+                    else if (derived->getOffsetInBits() == layoutOffset * 8 && derived->getSizeInBits() == type->getStructElementType(layoutIndex)->getPrimitiveSizeInBits())
                     {
-                        fieldDITypes.push_back(derived);
+                        fieldDITypes[fieldDITypes.size()] = derived;
+                        isPadding.push_back(false);
                         diElemIndex++;
                         layoutIndex++;
                     }
                     else
                     {
-                        ENV_DEBUG(dbgs() << "diElemIndex++\n");
                         diElemIndex++;
+                        ENV_DEBUG(dbgs() << "diElemIndex++: " << diElemIndex << "\n");
                     }
                 }
                 else
                 {
                     layoutIndex++;
-                    fieldDITypes.push_back(nullptr);
+                    isPadding.push_back(true);
+                    ENV_DEBUG(dbgs() << "layoutIndex++: " << layoutIndex << "\n");
+                    fieldDITypes[fieldDITypes.size()] = nullptr;
                 }
             }
             else if (auto subprogram = dyn_cast<DISubprogram>(elements[diElemIndex]))
@@ -1277,11 +1439,48 @@ public:
             }
         }
         structFieldDITypeMapping[mappingKey] = fieldDITypes;
-        if (fieldIndex < fieldDITypes.size())
+        ENV_DEBUG(dbgs() << "resolveStructFieldDIType fieldIndex: " << fieldIndex << ", fieldDITypes.size(): " << fieldDITypes.size() << "\n");
+        if (structFieldDITypeMapping[mappingKey].find(fieldIndex) != structFieldDITypeMapping[mappingKey].end() && !isPadding[fieldIndex])
         {
+            ENV_DEBUG(dbgs() << "resolveStructFieldDIType fieldDITypes[fieldIndex]: " << getDITypeString(fieldDITypes[fieldIndex]) << "\n");
             return fieldDITypes[fieldIndex];
         }
-        return nullptr;
+        else
+        {
+            // fieldIndex is out of the fieldDITypes, means the field given by fieldIndex is not found in the DICompositeType
+            DIType *firstFieldDIType = findFirstOffsetDIType(dyn_cast<DICompositeType>(structDIType), 0);
+            firstFieldDIType = pruneTypedef(firstFieldDIType);
+            ENV_DEBUG(dbgs() << "resolveStructFieldDIType firstFieldDIType: " << getDITypeString(firstFieldDIType) << "\n");
+            if (firstFieldDIType)
+            {
+                DIType *fieldDIType = resolveStructFieldDIType(M, type, firstFieldDIType, fieldIndex, mappingKey);
+                if (fieldDIType)
+                {
+                    ENV_DEBUG(dbgs() << "resolveStructFieldDIType fieldDIType: " << getDITypeString(fieldDIType) << "\n");
+                    structFieldDITypeMapping[mappingKey][fieldIndex] = fieldDIType;
+                    return fieldDIType;
+                }
+            }
+            string typeName = pruneStructName(type->getStructName().str());
+            if (!typeName.empty())
+            {
+                auto defDIType = structDITypes[typeName];
+                if (defDIType)
+                {
+                    DIType *fieldDIType = resolveStructFieldDIType(M, type, defDIType, fieldIndex, mappingKey);
+                    if (fieldDIType)
+                    {
+                        structFieldDITypeMapping[mappingKey][fieldIndex] = fieldDIType;
+                        return fieldDIType;
+                    }
+                }
+                else
+                {
+                    dbgs() << "[!] sgfuzz-source-pass: cannot find full definition, only forward declaration for type: " << typeName << "\n";
+                }
+            }
+            return nullptr;
+        }
     }
 
     void collectDITypesFromDIType(DIType *type)
@@ -1348,6 +1547,10 @@ public:
                 {
                     DITypesStack.push_back(DT);
                 }
+            }
+            for (auto *DT : CU->getEnumTypes())
+            {
+                DITypesStack.push_back(DT);
             }
             for (DIGlobalVariableExpression *DGVE : CU->getGlobalVariables())
             {
@@ -1604,6 +1807,10 @@ public:
 
     DIType *resolveStructField(Module &M, DICompositeType *CT, Type *type, vector<int> indices)
     {
+        if (!CT)
+        {
+            return nullptr;
+        }
         if (!type->isStructTy())
         {
             return nullptr;
@@ -1731,6 +1938,7 @@ public:
                 }
                 else if (auto subprogram = dyn_cast<DISubprogram>(elements[diElemIndex]))
                 {
+                    ENV_DEBUG(dbgs() << "subprogram\n");
                     diElemIndex++;
                 }
             }
@@ -2142,7 +2350,7 @@ public:
             if (!AI->getAllocatedType()->isPointerTy())
             {
                 info.name = "[unamed]";
-                info.type = VarTypeInfo::fromTypeAndDIType(AI->getAllocatedType());
+                info.type = fromTypeAndDIType(AI->getAllocatedType());
                 if (info.type.kind == VarTypeInfo::Kind::Struct)
                 {
                     DIType *structDIType = getStructDIType(info.type.info.struct_type.name);
@@ -2229,16 +2437,13 @@ public:
                         info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>();
 
                         DICompositeType *parentArrayDIType = nullptr;
-                        DIType *arrayElemDIType = nullptr;
-
-                        if (auto *composite = dyn_cast<DICompositeType>(parentInfo->DIType))
+                        if (auto *CT = dyn_cast<DICompositeType>(parentInfo->DIType))
                         {
-                            if (composite->getTag() == dwarf::DW_TAG_array_type)
+                            if (CT->getTag() == dwarf::DW_TAG_array_type)
                             {
-                                info.DIType = pruneTypedef(composite->getBaseType());
-                                arrayElemDIType = composite->getBaseType();
+                                info.DIType = pruneTypedef(CT->getBaseType());
                             }
-                            parentArrayDIType = composite;
+                            parentArrayDIType = CT;
                         }
                         else if (auto derived = dyn_cast<DIDerivedType>(parentInfo->DIType))
                         {
@@ -2250,82 +2455,11 @@ public:
                                     parentArrayDIType = DICT;
                                 }
                             }
-                            arrayElemDIType = derived->getBaseType();
-                        }
-                        else
-                        {
-                            arrayElemDIType = parentInfo->DIType;
                         };
 
-                        if (typeCompatible(F->getParent(), GEPSrcTy, parentArrayDIType))
+                        auto arrayElemDIType = resolveArrayFieldDIType(F->getParent(), GEPSrcTy, parentArrayDIType, 0);
+                        if (arrayElemDIType)
                         {
-                            info.DIType = arrayElemDIType;
-                        }
-                        else
-                        {
-                            // GEPSrc type is array, but parentDIType is a struct maybe?
-                            // GEP is accessing the field of the element of the struct/array
-                            DIType *parentFirstFieldDIType = nullptr;
-                            DICompositeType *parentDICompositeType = dyn_cast<DICompositeType>(parentArrayDIType);
-                            if (parentDICompositeType->getTag() == dwarf::DW_TAG_structure_type || parentDICompositeType->getTag() == dwarf::DW_TAG_class_type)
-                            {
-                                // parentDICompositeType is a struct
-                                // Maybe GEP is accessing the field of the first element of the struct
-                                for (int i = 0; i < parentDICompositeType->getElements().size(); i++)
-                                {
-                                    // Look for the first field (not the method)
-                                    auto *element = parentDICompositeType->getElements()[i];
-                                    if (element->getTag() == dwarf::DW_TAG_member || element->getTag() == dwarf::DW_TAG_inheritance)
-                                    {
-                                        parentFirstFieldDIType = dyn_cast<DIType>(element);
-                                        break;
-                                    }
-                                }
-                            }
-                            else if (parentDICompositeType->getTag() == dwarf::DW_TAG_array_type)
-                            {
-                                // parentDICompositeType is a pointer to array
-                                // Maybe GEP is access the field of the element of the array
-                                parentFirstFieldDIType = dyn_cast<DIType>(parentDICompositeType->getBaseType());
-                            }
-                            parentFirstFieldDIType = pruneTypedef(parentFirstFieldDIType);
-                            DICompositeType *parentFirstFieldDICompositeType = dyn_cast<DICompositeType>(parentFirstFieldDIType);
-                            assert(parentFirstFieldDICompositeType);
-                            if (typeCompatible(F->getParent(), GEPSrcTy, parentFirstFieldDICompositeType))
-                            {
-                                // GEP is accessing, the first field of the struct as the gep source type
-                                // GEPSrcTy is the composite type, so there is no need for try casting to array type
-                                CT = dyn_cast<DICompositeType>(parentFirstFieldDIType);
-                                if (CT->isForwardDecl())
-                                {
-                                    DIType *PCT = structDITypes[CT->getName().str()];
-                                    if (!PCT)
-                                    {
-                                        dbgs() << "Cannot find the definition of the struct: " << parentFirstFieldDICompositeType->getName().str() << "\n";
-                                        return std::nullopt;
-                                    }
-                                    CT = dyn_cast<DICompositeType>(PCT);
-                                }
-                                parentArrayDIType = CT;
-                                arrayElemDIType = CT->getBaseType();
-                                info.DIType = arrayElemDIType;
-                            }
-                            else
-                            {
-                                // GEP is accessing, the parent DIType as the gep source type
-                                errs() << "GEP accessing type is unresolvable, neither the parent type or the parent's first field type is compatible with the GEP source type.\n";
-                                return std::nullopt;
-                            }
-                        }
-
-                        if (arrayDimensionContainsPointer(GEPSrcTy))
-                        {
-                            // like: %arrayidx = getelementptr [4 x ptr], ptr %td, i64 0, i64 0
-                            // or:   %arrayidx = getelementptr [4 x [32 x ptr]], ptr @tagString, i64 0, i64 %idxprom
-                            // then element type should be derived from parentInfo
-                            // to avoid the opaque ptr poison the following type derivation
-                            // if parent's array element is also an array with length,
-                            // then the length is inherited
                             auto prunedArrayElemDIType = pruneTypedef(arrayElemDIType);
                             VarTypeInfo arrayElemVarType = resolveVarTypeFromDIType(prunedArrayElemDIType);
                             if (auto typedefName = resolveTypedefName(arrayElemDIType))
@@ -2334,36 +2468,20 @@ public:
                                 info.type.info.pointer.pointee->typedef_name = *typedefName;
                             }
                             info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(arrayElemVarType);
-                            ENV_DEBUG(dbgs() << "resolved parent array element type: " << info.type.info.pointer.pointee->to_string() << ", DIType: " << getDITypeString(prunedArrayElemDIType) << "\n");
+                            info.is_local = parentInfo->is_local;
+                            info.is_param = parentInfo->is_param;
+                            info.is_global = parentInfo->is_global;
+                            info.DIType = prunedArrayElemDIType;
                         }
                         else
                         {
-                            // like: %arrayidx = getelementptr [4 x i32], ptr %td, i64 0, i64 0
-                            // then element type should be derived from GEP source type
-                            auto prunedParentDIType = pruneTypedef(parentArrayDIType);
-                            VarTypeInfo gepSrcVarType = VarTypeInfo::fromTypeAndDIType(GEPSrcTy, prunedParentDIType);
-                            assert(gepSrcVarType.kind == VarTypeInfo::Kind::Array);
-                            assert(gepSrcVarType.info.array.elem_type);
-                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(*gepSrcVarType.info.array.elem_type);
-                            // if (gepSrcVarType.info.array.elem_type && gepSrcVarType.info.array.elem_type->kind == VarTypeInfo::Kind::Struct)
-                            // {
-                            //     auto structName = gepSrcVarType.info.array.elem_type->info.struct_type.name;
-                            //     if (!structName.empty())
-                            //     {
-                            //         if (auto DIType = getStructDIType(structName))
-                            //         {
-                            //             arrayElemDIType = DIType;
-                            //             info.DIType = DIType;
-                            //         }
-                            //     }
-                            // }
-                            if (auto typedefName = resolveTypedefName(arrayElemDIType))
-                            {
-                                ENV_DEBUG(dbgs() << "resolved parent array element typedef: " << *typedefName << "\n");
-                                info.type.info.pointer.pointee->typedef_name = *typedefName;
-                            }
-
-                            ENV_DEBUG(dbgs() << "resolved parent array element type: " << info.type.info.pointer.pointee->to_string() << ", DIType: " << getDITypeString(arrayElemDIType) << "\n");
+                            auto arrayElemType = GEPSrcTy->getArrayElementType();
+                            info.name = "[unamed]";
+                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(arrayElemType, nullptr));
+                            info.is_local = parentInfo->is_local;
+                            info.is_param = parentInfo->is_param;
+                            info.is_global = parentInfo->is_global;
+                            info.DIType = nullptr;
                         }
 
                         info.DIType = pruneTypedef(arrayElemDIType);
@@ -2396,6 +2514,13 @@ public:
                     }
                     else
                     {
+                        info = *parentInfo;
+                        info.type = VarTypeInfo();
+
+                        // Anyway, the type of GEP is a pointer to some type
+                        info.type.kind = VarTypeInfo::Kind::Pointer;
+                        info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>();
+
                         for (int i = 2; i < GEP->getNumOperands(); i++)
                         {
                             if (auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(i)))
@@ -2406,8 +2531,23 @@ public:
 
                         if (!parentInfo->DIType)
                         {
-                            ENV_DEBUG(dbgs() << "Failed to resolve parentInfo->DIType\n");
-                            return std::nullopt;
+                            info.name = "[unnamed]";
+                            Type *fieldType = GEPSrcTy;
+                            while (fieldIndices.size() > 0)
+                            {
+                                int fieldIndex = fieldIndices.front();
+                                fieldType = fieldType->getStructElementType(fieldIndex);
+                                fieldIndices.erase(fieldIndices.begin());
+                            }
+                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(fieldType, nullptr));
+                            info.DIType = nullptr;
+                            info.is_local = parentInfo->is_local;
+                            info.is_param = parentInfo->is_param;
+                            info.is_global = parentInfo->is_global;
+                            info.parent = std::make_unique<VarInfo>(*parentInfo);
+                            instructionVarInfoCache[GEP] = info;
+                            dbgs() << "[!] sgfuzz-source-pass: cannot find the DIType of the GEP: " << *V << ", producing unnamed var with type: " << info.type.to_string() << "\n";
+                            return info;
                         }
 
                         // the struct name of GEP source type may be the wrong one.
@@ -2416,7 +2556,6 @@ public:
                         // struct.b = type { i32, i32 }
                         // a and b are compatible types.
                         // %1 = getelementptr inbounds %struct.a, struct.b* %0, i32 0, i32 0
-                        auto structName = GEPSrcTy->getStructName().str();
                         DICompositeType *parentDIType = nullptr;
                         if (parentInfo->type.kind == VarTypeInfo::Kind::Pointer)
                         {
@@ -2431,8 +2570,6 @@ public:
                                 {
                                     DIType = derived->getBaseType();
                                 }
-                                // auto prunedDIType = pruneTypedef(derived->getBaseType());
-                                // assert(prunedDIType);
                                 parentDIType = dyn_cast<DICompositeType>(DIType);
                             }
                         }
@@ -2445,170 +2582,82 @@ public:
                             DIType *defDIType = structDITypes[parentDIType->getName().str()];
                             if (!defDIType)
                             {
-                                dbgs() << "Cannot find the definition of the struct: " << parentDIType->getName().str() << "\n";
-                                return std::nullopt;
+                                ENV_DEBUG(dbgs() << "producing unnamed var" << "\n");
+                                info.name = "[unnamed]";
+                                Type *fieldType = GEPSrcTy;
+                                while (fieldIndices.size() > 0)
+                                {
+                                    int fieldIndex = fieldIndices.front();
+                                    fieldType = fieldType->getStructElementType(fieldIndex);
+                                    fieldIndices.erase(fieldIndices.begin());
+                                }
+                                info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(GEPSrcTy, nullptr));
+                                info.DIType = nullptr;
+                                info.is_local = parentInfo->is_local;
+                                info.is_param = parentInfo->is_param;
+                                info.is_global = parentInfo->is_global;
+                                info.parent = std::make_unique<VarInfo>(*parentInfo);
+                                instructionVarInfoCache[GEP] = info;
+                                dbgs() << "[!] sgfuzz-source-pass: cannot find the definition of the DIType " << parentDIType->getName().str() << ", when resolving GEP: " << V->getName() << ", producing unnamed var with type: " << info.type.to_string() << "\n";
+                                return info;
                             }
                             parentDIType = dyn_cast<DICompositeType>(defDIType);
                         }
-                        // DIType *resolvedDIType = resolveStructFieldDIType(F->getParent(), GEPSrcTy, parentDIType, fieldIndices.front());
-                        if (typeCompatible(F->getParent(), GEPSrcTy, parentDIType, fieldIndices.front()))
+                        Type *fieldType = GEPSrcTy;
+                        DIType *structFieldDIType = parentDIType;
+                        ENV_DEBUG(dbgs() << "fieldType: " << *fieldType << ", parentDIType: " << getDITypeString(parentDIType) << "\n");
+                        while (fieldIndices.size() > 0)
                         {
-                            CT = parentDIType;
-                        }
-                        else
-                        {
-                            // GEP is accessing the field of the element of the struct/array
-                            DIType *parentFirstFieldDIType = nullptr;
-                            DICompositeType *parentDICompositeType = dyn_cast<DICompositeType>(parentDIType);
-                            if (parentDICompositeType->getTag() == dwarf::DW_TAG_structure_type || parentDICompositeType->getTag() == dwarf::DW_TAG_class_type)
+                            ENV_DEBUG(dbgs() << "resolving struct field at index: " << fieldIndices.front() << "\n");
+                            int fieldIndex = fieldIndices.front();
+                            fieldIndices.erase(fieldIndices.begin());
+                            auto prunedFieldDIType = pruneTypedef(structFieldDIType);
+                            auto prunedDICT = dyn_cast<DICompositeType>(prunedFieldDIType);
+                            ENV_DEBUG(dbgs() << "fieldType: " << *fieldType << ", prunedDICT: " << getDITypeString(prunedDICT) << "\n");
+                            if (prunedDICT->getTag() == dwarf::DW_TAG_union_type)
                             {
-                                // parentDICompositeType is a struct
-                                // Maybe GEP is accessing the field of the first element of the struct
-                                for (int i = 0; i < parentDICompositeType->getElements().size(); i++)
-                                {
-                                    // Look for the first field (not the method)
-                                    auto *element = parentDICompositeType->getElements()[i];
-                                    if (element->getTag() == dwarf::DW_TAG_member || element->getTag() == dwarf::DW_TAG_inheritance)
-                                    {
-                                        parentFirstFieldDIType = dyn_cast<DIType>(element);
-                                        break;
-                                    }
-                                }
-                            }
-                            else if (parentDICompositeType->getTag() == dwarf::DW_TAG_array_type)
-                            {
-                                // parentDICompositeType is a pointer to array
-                                // Maybe GEP is access the field of the element of the array
-                                parentFirstFieldDIType = dyn_cast<DIType>(parentDICompositeType->getBaseType());
-                            }
-                            parentFirstFieldDIType = pruneTypedef(parentFirstFieldDIType);
-                            DICompositeType *parentFirstFieldDICompositeType = dyn_cast<DICompositeType>(parentFirstFieldDIType);
-                            if (!parentFirstFieldDICompositeType)
-                            {
-                                dbgs() << "GEP accessing type is unresolvable, the parent's first field type is not a composite type.\n";
-                                return std::nullopt;
-                            }
-                            if (typeCompatible(F->getParent(), GEPSrcTy, parentFirstFieldDICompositeType, fieldIndices.front()))
-                            {
-                                // GEP is accessing, the first field of the struct as the gep source type
-                                // GEPSrcTy is the composite type, so there is no need for try casting to array type
-                                CT = dyn_cast<DICompositeType>(parentFirstFieldDIType);
-                                if (CT->isForwardDecl())
-                                {
-                                    DIType *PCT = structDITypes[CT->getName().str()];
-                                    if (!PCT)
-                                    {
-                                        dbgs() << "Cannot find the definition of the struct: " << parentFirstFieldDICompositeType->getName().str() << "\n";
-                                        return std::nullopt;
-                                    }
-                                    CT = dyn_cast<DICompositeType>(PCT);
-                                }
+                                structFieldDIType = resolveUnionField(*F->getParent(), prunedDICT, GEP, fieldIndices);
                             }
                             else
                             {
-                                // GEP is accessing, the parent DIType as the gep source type
-                                errs() << "GEP accessing type is unresolvable, neither the parent type or the parent's first field type is compatible with the GEP source type.\n";
-                                return std::nullopt;
+                                structFieldDIType = resolveStructFieldDIType(F->getParent(), fieldType, parentDIType, fieldIndex);
                             }
+                            fieldType = fieldType->getStructElementType(fieldIndex);
                         }
-                    }
 
-                    // GEPSrcTy is struct type or union type
-                    // like: %suites14 = getelementptr inbounds %struct.Suites, ptr %15, i32 0, i32 2
-                    // auto CI = dyn_cast<ConstantInt>(GEP->getOperand(2));
+                        ENV_DEBUG(dbgs() << "structFieldDIType: " << getDITypeString(structFieldDIType) << "\n");
 
-                    // vector<int> indices;
-                    // for (int i = 2; i < GEP->getNumOperands(); i++)
-                    // {
-                    //     if (auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(i)))
-                    //     {
-                    //         indices.push_back(CI->getZExtValue());
-                    //     }
-                    // }
-
-                    // The gep source type should be determined by the GEPSrcTy first
-                    // then the parentInfo->DIType.
-                    // Since the parentInfo->DIType may be the derived class,
-                    // and the GEPSrcTy may be the base class.
-
-                    // DICompositeType *CT = nullptr;
-
-                    DIType *fieldDIType = nullptr;
-                    if (CT && CT->getTag() == dwarf::DW_TAG_union_type)
-                    {
-                        // resolving the union field
-                        fieldDIType = resolveUnionField(*F->getParent(), CT, GEP, fieldIndices);
-                    }
-                    else if (CT)
-                    {
-                        // resolving the struct field
-                        fieldDIType = resolveStructField(*F->getParent(), CT, GEPSrcTy, fieldIndices);
-                    }
-                    else
-                    {
-                        // CT is nullptr
-                        // resolve the unnamed struct field
-                        // for example: %1 = getelementptr inbounds { i64, i64 }, ptr %ref.tmp, i64 0, i32 1
-                        Type *fieldType = GEPSrcTy;
-                        for (int i : fieldIndices)
+                        if (structFieldDIType)
                         {
-                            fieldType = fieldType->getStructElementType(i);
-                            assert(!fieldType->isPointerTy());
-                        }
-                        info.name = "[unamed]";
-                        info.type = VarTypeInfo::fromTypeAndDIType(fieldType, nullptr);
-                        info.is_local = parentInfo->is_local;
-                        info.is_param = parentInfo->is_param;
-                        info.is_global = parentInfo->is_global;
-                        info.DIType = nullptr;
-                        instructionVarInfoCache[GEP] = info;
-                        ENV_DEBUG(dbgs() << "resolved member: " << V->getName() << " -> " << info.name << ": " << info.type.to_string() << ", DIType: " << getDITypeString(info.DIType) << "\n");
-                        return info;
-                    }
-                    if (fieldDIType)
-                    {
-                        auto *prunedFieldDIType = pruneTypedef(fieldDIType);
-                        StringRef memberName = fieldDIType->getName();
-
-                        if (!memberName.empty() && prunedFieldDIType)
-                        {
-                            auto memberVarType = resolveVarTypeFromDIType(prunedFieldDIType);
-                            if (auto typedefName = resolveTypedefName(fieldDIType))
-                            {
-                                ENV_DEBUG(dbgs() << "resolved struct field typedef: " << *typedefName << "\n");
-                                memberVarType.typedef_name = *typedefName;
-                            }
-                            info.name = memberName.str();
-                            info.type.kind = VarTypeInfo::Kind::Pointer;
-                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(memberVarType);
-                            // info.type = memberVarType;
+                            info.name = structFieldDIType->getName().str();
+                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(fieldType, structFieldDIType));
+                            info.DIType = pruneTypedef(structFieldDIType);
                             info.is_local = parentInfo->is_local;
                             info.is_param = parentInfo->is_param;
                             info.is_global = parentInfo->is_global;
-                            info.DIType = prunedFieldDIType;
+                            info.parent = std::make_unique<VarInfo>(*parentInfo);
+                            if (auto typedefName = resolveTypedefName(structFieldDIType))
+                            {
+                                ENV_DEBUG(dbgs() << "resolved parent array element typedef: " << *typedefName << "\n");
+                                info.type.info.pointer.pointee->typedef_name = *typedefName;
+                            }
+                            instructionVarInfoCache[GEP] = info;
+                            ENV_DEBUG(dbgs() << "resolved member: " << V->getName() << " -> " << info.name << ": " << info.type.to_string() << ", DIType: " << getDITypeString(info.DIType) << "\n");
+                            return info;
+                        }
+                        else
+                        {
+                            info.name = "[unnamed]";
+                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(fieldType, nullptr));
+                            info.DIType = nullptr;
+                            info.is_local = parentInfo->is_local;
+                            info.is_param = parentInfo->is_param;
+                            info.is_global = parentInfo->is_global;
                             info.parent = std::make_unique<VarInfo>(*parentInfo);
                             instructionVarInfoCache[GEP] = info;
                             ENV_DEBUG(dbgs() << "resolved member: " << V->getName() << " -> " << info.name << ": " << info.type.to_string() << ", DIType: " << getDITypeString(info.DIType) << "\n");
                             return info;
                         }
-                    }
-                    else
-                    {
-                        dbgs() << "Cannot find DIType for the GEP: " << instructionValueName(V) << "\n";
-                        Type *fieldType = GEPSrcTy;
-                        for (int i : fieldIndices)
-                        {
-                            fieldType = fieldType->getStructElementType(i);
-                        }
-                        info.name = "[unnamed]";
-                        info.type = VarTypeInfo::fromTypeAndDIType(fieldType, nullptr);
-                        info.is_local = parentInfo->is_local;
-                        info.is_param = parentInfo->is_param;
-                        info.is_global = parentInfo->is_global;
-                        info.DIType = nullptr;
-                        instructionVarInfoCache[GEP] = info;
-                        ENV_DEBUG(dbgs() << "resolved member: " << V->getName() << " -> " << info.name << ": " << info.type.to_string() << ", DIType: " << getDITypeString(info.DIType) << "\n");
-                        return info;
                     }
                 }
             }
@@ -2655,7 +2704,7 @@ public:
                 if (!LITy->isPointerTy())
                 {
                     DIType *prunedDIType = pruneTypedef(diType);
-                    info.type = VarTypeInfo::fromTypeAndDIType(LITy, prunedDIType);
+                    info.type = fromTypeAndDIType(LITy, prunedDIType);
                 }
                 else if (ptrInfo->type.kind == VarTypeInfo::Kind::Pointer)
                 {
@@ -2943,7 +2992,7 @@ std::string addPrefixToFilename(const std::string &filePath, const std::string &
 
 SGFuzzPass::SGFuzzPass()
 {
-    dbgs() << "SGFuzzPass()\n";
+    ENV_DEBUG(dbgs() << "SGFuzzPass()\n");
 
     ppId = 0;
 
@@ -2958,7 +3007,7 @@ SGFuzzPass::SGFuzzPass()
 
 SGFuzzPass::~SGFuzzPass()
 {
-    dbgs() << "~SGFuzzPass()\n";
+    ENV_DEBUG(dbgs() << "~SGFuzzPass()\n");
 }
 
 PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
@@ -3434,7 +3483,7 @@ VarTypeInfo VarInfoResolver::resolveVarTypeFromDIType(DIType *type)
     {
         if (auto derived = dyn_cast<DIDerivedType>(type))
         {
-            if (derived->getTag() == llvm::dwarf::DW_TAG_typedef || derived->getTag() == llvm::dwarf::DW_TAG_const_type || derived->getTag() == llvm::dwarf::DW_TAG_volatile_type || derived->getTag() == llvm::dwarf::DW_TAG_enumeration_type || derived->getTag() == llvm::dwarf::DW_TAG_rvalue_reference_type)
+            if (derived->getTag() == llvm::dwarf::DW_TAG_typedef || derived->getTag() == llvm::dwarf::DW_TAG_const_type || derived->getTag() == llvm::dwarf::DW_TAG_volatile_type || derived->getTag() == llvm::dwarf::DW_TAG_rvalue_reference_type)
             {
                 if (derived->getTag() == llvm::dwarf::DW_TAG_typedef && typedefName.empty())
                 {
@@ -3466,6 +3515,19 @@ VarTypeInfo VarInfoResolver::resolveVarTypeFromDIType(DIType *type)
             info.kind = VarTypeInfo::Kind::Pointer;
             info.info.pointer.pointee = std::make_unique<VarTypeInfo>(resolveVarTypeFromDIType(derived->getBaseType()));
             diTypeToVarTypeInfoCache[derived] = info;
+            ENV_DEBUG(dbgs() << "resolved pointer var type: " << info.to_string() << ", DIType: " << getDITypeString(derived) << "\n");
+            return info;
+        }
+
+        if (derived->getTag() == llvm::dwarf::DW_TAG_enumeration_type)
+        {
+            ENV_DEBUG(dbgs() << "DW_TAG_enumeration_type: " << getDITypeString(derived) << "\n");
+            VarTypeInfo info;
+            info.typedef_name = typedefName;
+            info.kind = VarTypeInfo::Kind::Enum;
+            info.info.enum_type.name = derived->getName().str();
+            diTypeToVarTypeInfoCache[derived] = info;
+            ENV_DEBUG(dbgs() << "resolved enum var type: " << info.to_string() << ", DIType: " << getDITypeString(derived) << "\n");
             return info;
         }
 
@@ -3490,6 +3552,7 @@ VarTypeInfo VarInfoResolver::resolveVarTypeFromDIType(DIType *type)
                 // 普通成员变量
                 VarTypeInfo info = resolveVarTypeFromDIType(derived->getBaseType());
                 diTypeToVarTypeInfoCache[derived] = info;
+                ENV_DEBUG(dbgs() << "resolved member var type: " << info.to_string() << ", DIType: " << getDITypeString(derived) << "\n");
                 return info;
             }
         }
