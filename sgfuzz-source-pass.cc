@@ -528,6 +528,7 @@ struct VarTypeInfo
         Array,
         Struct,
         Bitfield,
+        Enum,
         Other
     } kind;
 
@@ -559,6 +560,10 @@ struct VarTypeInfo
         {
             std::string name;
         } other;
+        struct
+        {
+            std::string name;
+        } enum_type;
     } info;
 
     VarTypeInfo &operator=(const VarTypeInfo &other)
@@ -586,6 +591,9 @@ struct VarTypeInfo
             break;
         case Kind::Other:
             info.other.name = other.info.other.name;
+            break;
+        case Kind::Enum:
+            info.enum_type.name = other.info.enum_type.name;
             break;
         }
         return *this;
@@ -616,6 +624,9 @@ struct VarTypeInfo
             break;
         case Kind::Other:
             info.other.name = other.info.other.name;
+            break;
+        case Kind::Enum:
+            info.enum_type.name = other.info.enum_type.name;
             break;
         }
     }
@@ -660,6 +671,9 @@ struct VarTypeInfo
         case Kind::Other:
             j = {{"Other", {{"name", info.other.name}}}};
             break;
+        case Kind::Enum:
+            j["Enum"] = {{"name", info.enum_type.name}};
+            break;
         }
         return j;
     }
@@ -689,7 +703,10 @@ struct VarTypeInfo
             name = "bitfield{width: " + std::to_string(info.bitfield.width) + ", offset: " + std::to_string(info.bitfield.offset) + "}";
             break;
         case Kind::Other:
-            name = info.other.name;
+            name = "other." + info.other.name;
+            break;
+        case Kind::Enum:
+            name = "enum." + info.enum_type.name;
             break;
         default:
             name = "unknown";
@@ -841,7 +858,7 @@ private:
 
     std::map<Value *, DIType *> valueDITypeCache;
 
-    std::map<string, vector<DIType *>> structFieldDITypeCache;
+    std::map<DIType *, vector<DIType *>> structFieldDITypeCache;
 
     std::map<DICompositeType *, vector<DIDerivedType *>> unionFieldDITypeCache;
 
@@ -852,7 +869,7 @@ private:
 public:
     VarTypeInfo resolveVarTypeFromDIType(DIType *type);
 
-    std::optional<VarInfo> interprete(Module *M, Type *type, VarInfo var)
+    std::optional<VarInfo> interpret(Module *M, Type *type, VarInfo var)
     {
         // type can only be primitive type or vector type (<2 x i32>)
         assert(!type->isStructTy() && "type must not be a struct type");
@@ -863,7 +880,7 @@ public:
             return var;
         }
 
-        ENV_DEBUG(errs() << "interprete: " << *type << ", DIType: " << getDITypeString(var.DIType) << ", var: " << var.type.to_string() << "\n");
+        ENV_DEBUG(errs() << "interpret: " << *type << ", DIType: " << getDITypeString(var.DIType) << ", var: " << var.type.to_string() << "\n");
 
         if (type->isVectorTy())
         {
@@ -874,7 +891,7 @@ public:
         addressDIType = pruneTypedef(addressDIType);
         if (primitiveTypeCompatible(type, addressDIType))
         {
-            ENV_DEBUG(errs() << "interprete primitiveTypeCompatible: " << *type << ", " << getDITypeString(addressDIType) << "\n");
+            ENV_DEBUG(errs() << "interpret primitiveTypeCompatible: " << *type << ", " << getDITypeString(addressDIType) << "\n");
             return var;
         }
         if (auto *derived = dyn_cast<DIDerivedType>(addressDIType))
@@ -884,12 +901,12 @@ public:
                 addressDIType = derived->getBaseType();
                 if (!pruneTypedef(addressDIType))
                 {
-                    ENV_DEBUG(errs() << "interprete void*: " << *type << ", " << getDITypeString(derived) << "\n");
+                    ENV_DEBUG(errs() << "interpret void*: " << *type << ", " << getDITypeString(derived) << "\n");
                     return var;
                 }
                 if (primitiveTypeCompatible(type, addressDIType))
                 {
-                    ENV_DEBUG(errs() << "interprete pointee: " << *type << ", " << getDITypeString(addressDIType) << "\n");
+                    ENV_DEBUG(errs() << "interpret pointee: " << *type << ", " << getDITypeString(addressDIType) << "\n");
                     return var;
                 }
             }
@@ -898,11 +915,11 @@ public:
         {
             DIType *fieldDIType = nullptr;
             fieldDIType = resolveStructFieldDIType(M, type, addressDIType, 0);
-            ENV_DEBUG(errs() << "interprete resolveStructFieldDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
+            ENV_DEBUG(errs() << "interpret resolveStructFieldDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
             if (!fieldDIType)
             {
                 fieldDIType = findFirstOffsetDIType(dyn_cast<DICompositeType>(addressDIType), 0);
-                ENV_DEBUG(errs() << "interprete findFirstOffsetDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
+                ENV_DEBUG(errs() << "interpret findFirstOffsetDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
             }
             if (!fieldDIType)
             {
@@ -913,7 +930,7 @@ public:
             current.type = resolveVarTypeFromDIType(fieldDIType);
             current.parent = std::make_unique<VarInfo>(var);
             current.DIType = pruneTypedef(fieldDIType);
-            if (auto operand = interprete(M, type, current))
+            if (auto operand = interpret(M, type, current))
             {
                 return operand;
             }
@@ -921,13 +938,13 @@ public:
         else if (addressDIType->getTag() == dwarf::DW_TAG_array_type)
         {
             DIType *arrayElemDIType = dyn_cast<DICompositeType>(addressDIType)->getBaseType();
-            ENV_DEBUG(errs() << "interprete arrayElemDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
+            ENV_DEBUG(errs() << "interpret arrayElemDIType: " << *type << ", " << getDITypeString(var.DIType) << "\n");
             VarInfo current = var;
             current.name = arrayElemDIType->getName().str();
             current.type = resolveVarTypeFromDIType(arrayElemDIType);
             current.parent = std::make_unique<VarInfo>(var);
             current.DIType = pruneTypedef(arrayElemDIType);
-            if (auto operand = interprete(M, type, current))
+            if (auto operand = interpret(M, type, current))
             {
                 return operand;
             }
@@ -1206,17 +1223,28 @@ public:
         // StructType may contain padding object, merge multiple bitfield into one field element
         while (diElemIndex < elements.size() && layoutIndex < type->getStructNumElements())
         {
-            ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *type->getStructElementType(layoutIndex) << "\n");
-            ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << "\n");
             uint64_t layoutOffset = SL->getElementOffset(layoutIndex);
+            ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *type->getStructElementType(layoutIndex) << ", offset: " << layoutOffset * 8 << "\n");
             if (auto derived = dyn_cast<DIDerivedType>(elements[diElemIndex]))
             {
-                if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
+                ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << ", offset: " << derived->getOffsetInBits() << "\n");
+                if (derived->isBitField() || (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember))
+                {
+                    diElemIndex++;
+                }
+                else if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
                 {
                     fieldDITypes.push_back(derived);
                     diElemIndex++;
                     layoutIndex++;
                 }
+                // else if (auto *baseCT = dyn_cast<DICompositeType>(derived->getBaseType()))
+                // {
+                //     if (derived->getTag() == llvm::dwarf::DW_TAG_array_type)
+                //     {
+
+                //     }
+                // }
                 else if (derived->getTag() == llvm::dwarf::DW_TAG_inheritance)
                 {
                     DICompositeType *baseCT = dyn_cast<DICompositeType>(derived->getBaseType());
@@ -1236,10 +1264,6 @@ public:
                         ENV_DEBUG(dbgs() << "diElemIndex++\n");
                         diElemIndex++;
                     }
-                }
-                else if (derived->isBitField() || (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember))
-                {
-                    diElemIndex++;
                 }
                 else
                 {
@@ -1602,13 +1626,13 @@ public:
             fieldDITypes.clear();
 
             auto name = CT->getName().str();
-            if (!name.empty() && structFieldDITypeCache.find(name) != structFieldDITypeCache.end())
+            if (structFieldDITypeCache.find(CT) != structFieldDITypeCache.end())
             {
                 // nullable
-                if (index < structFieldDITypeCache[name].size())
+                if (index < structFieldDITypeCache[CT].size())
                 {
-                    ENV_DEBUG(dbgs() << "hit struct field DIType cache: " << name << ", " << index << ", DIType: " << getDITypeString(structFieldDITypeCache[name][index]) << "\n");
-                    result = structFieldDITypeCache[name][index];
+                    ENV_DEBUG(dbgs() << "hit struct field DIType cache: " << name << ", " << index << ", DIType: " << getDITypeString(structFieldDITypeCache[CT][index]) << "\n");
+                    result = structFieldDITypeCache[CT][index];
                     if (auto *PCT = dyn_cast<DICompositeType>(pruneTypedef(result)))
                     {
                         CT = PCT;
@@ -1664,12 +1688,16 @@ public:
             // StructType may contain padding object, merge multiple bitfield into one field element
             while (diElemIndex < elements.size() && layoutIndex < type->getStructNumElements())
             {
-                ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *type->getStructElementType(layoutIndex) << "\n");
-                ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << "\n");
                 uint64_t layoutOffset = SL->getElementOffset(layoutIndex);
+                ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *type->getStructElementType(layoutIndex) << ", offset: " << SL->getElementOffset(layoutIndex) * 8 << "\n");
                 if (auto derived = dyn_cast<DIDerivedType>(elements[diElemIndex]))
                 {
-                    if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
+                    ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << ", offset: " << derived->getOffsetInBits() << "\n");
+                    if (derived->isBitField() || (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember))
+                    {
+                        diElemIndex++;
+                    }
+                    else if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
                     {
                         fieldDITypes.push_back(derived);
                         diElemIndex++;
@@ -1695,10 +1723,6 @@ public:
                             diElemIndex++;
                         }
                     }
-                    else if (derived->isBitField() || (derived->getFlags() & llvm::DINode::DIFlags::FlagStaticMember))
-                    {
-                        diElemIndex++;
-                    }
                     else
                     {
                         layoutIndex++;
@@ -1711,25 +1735,25 @@ public:
                 }
             }
 
-            if (name == "ManualResetEvent")
-            {
-                ENV_DEBUG(dbgs() << "debug ManualResetEvent\n");
-                ENV_DEBUG(dbgs() << "fieldDITypes size: " << fieldDITypes.size() << "\n");
-                for (auto field : fieldDITypes)
-                {
-                    ENV_DEBUG(dbgs() << "field: " << getDITypeString(field) << "\n");
-                }
+            // if (name == "ManualResetEvent")
+            // {
+            //     ENV_DEBUG(dbgs() << "debug ManualResetEvent\n");
+            //     ENV_DEBUG(dbgs() << "fieldDITypes size: " << fieldDITypes.size() << "\n");
+            //     for (auto field : fieldDITypes)
+            //     {
+            //         ENV_DEBUG(dbgs() << "field: " << getDITypeString(field) << "\n");
+            //     }
 
-                ENV_DEBUG(dbgs() << "type: " << *type << "\n");
-                for (int i = 0; i < type->getStructNumElements(); i++)
-                {
-                    ENV_DEBUG(dbgs() << "element " << i << ": " << *type->getStructElementType(i) << ", offset: " << SL->getElementOffset(i) << "\n");
-                }
-            }
+            //     ENV_DEBUG(dbgs() << "type: " << *type << "\n");
+            //     for (int i = 0; i < type->getStructNumElements(); i++)
+            //     {
+            //         ENV_DEBUG(dbgs() << "element " << i << ": " << *type->getStructElementType(i) << ", offset: " << SL->getElementOffset(i) << "\n");
+            //     }
+            // }
 
             if (!name.empty())
             {
-                structFieldDITypeCache[name] = fieldDITypes;
+                structFieldDITypeCache[CT] = fieldDITypes;
             }
             result = fieldDITypes[index];
 
@@ -2426,6 +2450,7 @@ public:
                             }
                             parentDIType = dyn_cast<DICompositeType>(defDIType);
                         }
+                        // DIType *resolvedDIType = resolveStructFieldDIType(F->getParent(), GEPSrcTy, parentDIType, fieldIndices.front());
                         if (typeCompatible(F->getParent(), GEPSrcTy, parentDIType, fieldIndices.front()))
                         {
                             CT = parentDIType;
@@ -2458,7 +2483,11 @@ public:
                             }
                             parentFirstFieldDIType = pruneTypedef(parentFirstFieldDIType);
                             DICompositeType *parentFirstFieldDICompositeType = dyn_cast<DICompositeType>(parentFirstFieldDIType);
-                            assert(parentFirstFieldDICompositeType);
+                            if (!parentFirstFieldDICompositeType)
+                            {
+                                dbgs() << "GEP accessing type is unresolvable, the parent's first field type is not a composite type.\n";
+                                return std::nullopt;
+                            }
                             if (typeCompatible(F->getParent(), GEPSrcTy, parentFirstFieldDICompositeType, fieldIndices.front()))
                             {
                                 // GEP is accessing, the first field of the struct as the gep source type
@@ -2793,10 +2822,11 @@ public:
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
     bool replaceMainFunction(Module &M);
     void record(vector<VariableInfo> &varInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, VarInfo &var_info, uint64_t id, string detail);
-    bool scan(Module &M, FunctionCallee &instrument_fn, vector<string> &patching_types);
+    bool scan(Module &M, FunctionCallee &instrument_fn);
     void dumpModuleToFile(const Module &M);
-    bool handleStoreInstruction(Module &M, Function *F, StoreInst *SI, vector<VariableInfo> &patchPointInfoList, vector<string> &patchingVariableNames);
+    bool handleStoreInstruction(Module &M, Function *F, StoreInst *SI, vector<VariableInfo> &patchPointInfoList);
     bool instrument(vector<VariableInfo> &patchPointInfoList, Module &M, Function *F, Function *stackmap_intr);
+    bool shouldInstrument(VarInfo &varInf);
 
 private:
     vector<tuple<string, string>> patchingVariableWhiteList;
@@ -2807,6 +2837,8 @@ private:
 
     VarInfoResolver varResolver;
     vector<VariableInfo> varInfoList;
+
+    vector<string> patchingTypes;
 };
 
 std::optional<std::string> resolveTypedefName(DIType *ty)
@@ -2931,7 +2963,7 @@ SGFuzzPass::~SGFuzzPass()
 
 PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
 {
-    ENV_DEBUG(dbgs() << "FT: FuzztructionSourcePass run on file: " << M.getSourceFileName() << "\n");
+    ENV_DEBUG(dbgs() << "FuzztructionSourcePass run on file: " << M.getSourceFileName() << "\n");
 
     std::error_code ErrorCode;
     std::string ModuleFileName = M.getSourceFileName() + ".sgfuzz.ll";
@@ -2945,7 +2977,6 @@ PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
         return PreservedAnalyses::all();
     }
 
-    vector<string> patching_types;
     if (env_var_set("SGFUZZ_PATCHING_TYPE_FILE"))
     {
         string patchingTypeFile = getenv("SGFUZZ_PATCHING_TYPE_FILE");
@@ -2953,9 +2984,14 @@ PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
         string line;
         while (getline(file, line))
         {
-            patching_types.push_back(line);
+            patchingTypes.push_back(line);
         }
         file.close();
+    }
+    else
+    {
+        dbgs() << "[x] sgfuzz-llvm-pass: No patching types specified, SGFUZZ_PATCHING_TYPE_FILE is not set !\n";
+        assert(false && "No patching types specified !");
     }
 
     bool ModuleModified = false;
@@ -2980,7 +3016,7 @@ PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
         ModuleModified = true;
     }
 
-    ModuleModified |= scan(M, instrumentFunc, patching_types);
+    ModuleModified |= scan(M, instrumentFunc);
 
     auto fileName = M.getSourceFileName() + ".sgfuzz.pp.json";
     ofstream varJsonFile(fileName);
@@ -3044,6 +3080,37 @@ string ins2ppTy(Instruction &I)
     {
         return "RANDOM";
     }
+}
+
+bool SGFuzzPass::shouldInstrument(VarInfo &var)
+{
+    if (!patchingTypes.empty())
+    {
+        for (auto &pt : patchingTypes)
+        {
+            if (var.type.kind == VarTypeInfo::Kind::Int &&
+                var.type.typedef_name == pt)
+            {
+                return true;
+            }
+            else if (var.type.kind == VarTypeInfo::Kind::Enum && var.type.info.enum_type.name == pt)
+            {
+                return true;
+            }
+            else if (var.type.kind == VarTypeInfo::Kind::Pointer)
+            {
+                if (var.type.info.pointer.pointee->typedef_name == pt)
+                {
+                    return true;
+                }
+                if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Enum && var.type.info.pointer.pointee->info.enum_type.name == pt)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 void SGFuzzPass::record(vector<VariableInfo> &patchPointInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, VarInfo &var_info, uint64_t id, string detail)
@@ -3135,7 +3202,7 @@ bool onlyUsedInMemCall(Value *V)
     return false;
 }
 
-bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, vector<VariableInfo> &patchPointInfoList, vector<string> &patchingTypes)
+bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, vector<VariableInfo> &patchPointInfoList)
 {
     ENV_DEBUG(dbgs() << "Handling store: " << *SI << "\n");
     if (SI->getMetadata("nopatch"))
@@ -3143,54 +3210,33 @@ bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, v
         return false;
     }
 
-    bool needInstrument = false;
-
     auto var = varResolver.resolveVarInfo(SI->getPointerOperand(), F);
     if (!var)
     {
         return false;
     }
 
-    auto operand = varResolver.interprete(&M, SI->getOperand(0)->getType(), *var);
+    if (SI->getOperand(0)->getType()->isStructTy() || SI->getOperand(0)->getType()->isArrayTy())
+    {
+        return false;
+    }
+
+    auto operand = varResolver.interpret(&M, SI->getOperand(0)->getType(), *var);
     if (!operand)
     {
         return false;
     }
     ENV_DEBUG(dbgs() << "operand: name: " << operand->name << ", type: " << operand->type.to_string() << ", type_def: " << operand->type.typedef_name << "\n");
 
-    if (!patchingTypes.empty())
+    if (!shouldInstrument(*var))
     {
-        for (auto &pt : patchingTypes)
-        {
-            if (operand->type.kind == VarTypeInfo::Kind::Int &&
-                operand->type.typedef_name == pt)
-            {
-                dbgs() << "[+] sgfuzz-llvm-pass: Encounter store instruction for enum type: " << pt << ", " << *SI << "\n";
-                if (!SI->getOperand(0)->getType()->isIntegerTy())
-                {
-                    errs() << "[!] sgfuzz-llvm-pass: Skipping it due to the type of the store operand is not integer, maybe array (<2 x i32>) generated by vectorization\n";
-                    return false;
-                }
-                needInstrument = true;
-                break;
-            }
-            else if (operand->type.kind == VarTypeInfo::Kind::Pointer &&
-                     operand->type.info.pointer.pointee->typedef_name == pt)
-            {
-                dbgs() << "[+] sgfuzz-llvm-pass: Encounter store instruction for enum type: " << pt << ", " << *SI << "\n";
-                if (!SI->getOperand(0)->getType()->isIntegerTy())
-                {
-                    errs() << "[!] sgfuzz-llvm-pass: Skipping it due to the type of the store operand is not integer, maybe array (<2 x i32>) generated by vectorization\n";
-                    return false;
-                }
-                needInstrument = true;
-                break;
-            }
-        }
+        return false;
     }
+    dbgs() << "[+] sgfuzz-llvm-pass: Encounter store operand whose type falls within the patching types: " << var->type.to_string() << "\n";
 
-    if (!needInstrument)
+    if (!SI->getOperand(0)->getType()->isIntegerTy())
     {
+        dbgs() << "[!] sgfuzz-llvm-pass: Skip this store operand due to the type is " << *SI->getOperand(0)->getType() << ", not integer\n";
         return false;
     }
 
@@ -3203,7 +3249,7 @@ bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, v
     }
 
     uint64_t id = ppId++;
-    ENV_DEBUG(dbgs() << "FT: Instrumenting store instruction: " << id << " " << *SI << "\n");
+    ENV_DEBUG(dbgs() << "Instrumenting store instruction: " << id << " " << *SI << "\n");
 
     // patching the operand of the store instruction, which is the SI->getOperand(0)
     record(patchPointInfoList, SI, InstrumentType::ARGS, target, "STORE", *operand, id, "");
@@ -3267,7 +3313,7 @@ bool SGFuzzPass::replaceMainFunction(Module &M)
     return modified;
 }
 
-bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn, vector<string> &patching_types)
+bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn)
 {
     dbgs() << "[+] sgfuzz-llvm-pass: Scanning and instrumenting module\n";
     Value *instrument_fn_value = instrument_fn.getCallee();
@@ -3309,7 +3355,7 @@ bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn, vector<string> &
             {
                 if (auto *SI = dyn_cast<StoreInst>(&*DI++))
                 {
-                    if (handleStoreInstruction(M, &F, SI, funcVarInfoList, patching_types))
+                    if (handleStoreInstruction(M, &F, SI, funcVarInfoList))
                     {
                         modified = true;
                         num_patchpoints++;
@@ -3525,6 +3571,17 @@ VarTypeInfo VarInfoResolver::resolveVarTypeFromDIType(DIType *type)
             info.info.struct_type.name = composite->getName().str();
             diTypeToVarTypeInfoCache[composite] = info;
             ENV_DEBUG(dbgs() << "resolved struct var type: " << info.to_string() << ", DIType: " << getDITypeString(composite) << "\n");
+            return info;
+        }
+
+        if (composite->getTag() == llvm::dwarf::DW_TAG_enumeration_type)
+        {
+            VarTypeInfo info;
+            info.typedef_name = typedefName;
+            info.kind = VarTypeInfo::Kind::Enum;
+            info.info.enum_type.name = composite->getName().str();
+            diTypeToVarTypeInfoCache[composite] = info;
+            ENV_DEBUG(dbgs() << "resolved enum var type: " << info.to_string() << ", DIType: " << getDITypeString(composite) << "\n");
             return info;
         }
     }
