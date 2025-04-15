@@ -111,6 +111,38 @@ DIDerivedType *findFirstOffsetDIType(DICompositeType *CT, int offset = 0)
     return nullptr;
 }
 
+bool isEmptyClass(DIType *ty)
+{
+    if (ty->getTag() == dwarf::DW_TAG_inheritance)
+    {
+        ty = dyn_cast<DICompositeType>(ty)->getBaseType();
+    }
+    return dyn_cast<DICompositeType>(ty)->getSizeInBits() == 8;
+}
+
+int getTypeSizeInBits(Module *M, Type *ty)
+{
+    if (ty->isPointerTy())
+    {
+        return 64;
+    }
+    else if (ty->isStructTy())
+    {
+        DataLayout DL(M);
+        const StructLayout *SL = DL.getStructLayout(dyn_cast<StructType>(ty));
+        return SL->getSizeInBits();
+    }
+    else if (ty->isArrayTy())
+    {
+        int elemSize = getTypeSizeInBits(M, ty->getArrayElementType());
+        return elemSize * ty->getArrayNumElements();
+    }
+    else
+    {
+        return ty->getPrimitiveSizeInBits();
+    }
+}
+
 bool lastFieldIsPaddingField(Type *ty)
 {
     if (ty->getStructNumElements() == 0)
@@ -230,6 +262,17 @@ string getDITypeString(DIType *ty)
     {
         auto derived = dyn_cast<DIDerivedType>(ty);
         res = "ref " + getDITypeString(derived->getBaseType());
+        break;
+    }
+    case dwarf::DW_TAG_union_type:
+    {
+        auto derived = dyn_cast<DICompositeType>(ty);
+        res = "union.{";
+        for (auto elem : derived->getElements())
+        {
+            res += getDITypeString(dyn_cast<DIType>(elem)) + ",";
+        }
+        res += "}";
         break;
     }
     default:
@@ -1234,6 +1277,7 @@ public:
         {
             return dyn_cast<DICompositeType>(arrayDIType)->getBaseType();
         }
+        ENV_DEBUG(dbgs() << "resolveArrayFieldDIType: " << typeName(type) << ", " << DITypeName(arrayDIType) << ", " << fieldIndex << "\n");
         string mappingKey = typeName(type) + "-" + DITypeName(arrayDIType);
         if (structFieldDITypeMapping.find(mappingKey) != structFieldDITypeMapping.end())
         {
@@ -1283,9 +1327,10 @@ public:
         {
             // %1 is struct type, then its type is not matched, but its first field may be matched
             auto CT = dyn_cast<DICompositeType>(arrayDIType);
-            auto firstFieldDIType = findFirstOffsetDIType(CT, 0);
+            DIType *firstFieldDIType = findFirstOffsetDIType(CT, 0);
             if (firstFieldDIType)
             {
+                firstFieldDIType = pruneTypedef(firstFieldDIType);
                 return resolveArrayFieldDIType(M, type, firstFieldDIType, fieldIndex);
             }
         }
@@ -1367,7 +1412,7 @@ public:
         if (elements.size() == 0)
         {
             DIType *defDIType = structDITypes[structDIType->getName().str()];
-            if (defDIType)
+            if (defDIType && dyn_cast<DICompositeType>(defDIType)->getElements().size() > 0)
             {
                 elements = dyn_cast<DICompositeType>(defDIType)->getElements();
             }
@@ -1384,7 +1429,8 @@ public:
         while (diElemIndex < elements.size() && layoutIndex < type->getStructNumElements())
         {
             uint64_t layoutOffset = SL->getElementOffset(layoutIndex);
-            ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *type->getStructElementType(layoutIndex) << ", offset: " << layoutOffset * 8 << "\n");
+            Type *fieldType = type->getStructElementType(layoutIndex);
+            ENV_DEBUG(dbgs() << "Struct type element: " << layoutIndex << ": " << *fieldType << ", offset: " << layoutOffset * 8 << "\n");
             if (auto derived = dyn_cast<DIDerivedType>(elements[diElemIndex]))
             {
                 ENV_DEBUG(dbgs() << "DICompositeType element: " << diElemIndex << ": " << getDITypeString(dyn_cast<DIType>(elements[diElemIndex])) << ", offset: " << derived->getOffsetInBits() << "\n");
@@ -1393,11 +1439,7 @@ public:
                     diElemIndex++;
                     continue;
                 }
-                if (derived->isBitField())
-                {
-                    diElemIndex++;
-                }
-                else if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
+                if (derived->getTag() == llvm::dwarf::DW_TAG_member && derived->getOffsetInBits() == layoutOffset * 8)
                 {
                     fieldDITypes[fieldDITypes.size()] = derived;
                     isPadding.push_back(false);
@@ -1407,12 +1449,12 @@ public:
                 else if (derived->getTag() == llvm::dwarf::DW_TAG_inheritance)
                 {
                     DICompositeType *baseCT = dyn_cast<DICompositeType>(derived->getBaseType());
-                    if (derived->getFlags() & llvm::DINode::DIFlags::FlagVirtual)
+                    if (derived->getFlags() & llvm::DINode::DIFlags::FlagVirtual || isEmptyClass(baseCT))
                     {
                         // virtual inheritance
                         diElemIndex++;
                     }
-                    else if (derived->getOffsetInBits() == layoutOffset * 8 && derived->getSizeInBits() == type->getStructElementType(layoutIndex)->getPrimitiveSizeInBits())
+                    else if (derived->getOffsetInBits() == layoutOffset * 8)
                     {
                         fieldDITypes[fieldDITypes.size()] = derived;
                         isPadding.push_back(false);
@@ -1425,12 +1467,17 @@ public:
                         ENV_DEBUG(dbgs() << "diElemIndex++: " << diElemIndex << "\n");
                     }
                 }
-                else
+                else if (derived->getOffsetInBits() > layoutOffset * 8)
                 {
                     layoutIndex++;
                     isPadding.push_back(true);
                     ENV_DEBUG(dbgs() << "layoutIndex++: " << layoutIndex << "\n");
                     fieldDITypes[fieldDITypes.size()] = nullptr;
+                }
+                else
+                {
+                    diElemIndex++;
+                    ENV_DEBUG(dbgs() << "diElemIndex++: " << diElemIndex << "\n");
                 }
             }
             else if (auto subprogram = dyn_cast<DISubprogram>(elements[diElemIndex]))
@@ -1984,6 +2031,38 @@ public:
         }
 
         return result;
+    }
+
+    DIType *resolveUnionFieldDIType(Module *M, Type *type, DIType *unionDIType, int fieldDIIndex)
+    {
+        if (!type->isStructTy() && !type->isPointerTy())
+        {
+            return nullptr;
+        }
+        ENV_DEBUG(dbgs() << "resolveUnionFieldDIType: " << *type << ", " << getDITypeString(unionDIType) << ", fieldDIIndex: " << fieldDIIndex << "\n");
+        if (auto CT = dyn_cast<DICompositeType>(unionDIType))
+        {
+            if (CT->getTag() == dwarf::DW_TAG_union_type)
+            {
+                return dyn_cast<DIType>(CT->getElements()[fieldDIIndex]);
+            }
+            else if (CT->getTag() == dwarf::DW_TAG_array_type)
+            {
+                auto baseType = CT->getBaseType();
+                baseType = pruneTypedef(baseType);
+                return resolveUnionFieldDIType(M, type, baseType, fieldDIIndex);
+            }
+            else
+            {
+                DIType *firstFieldDIType = findFirstOffsetDIType(CT, 0);
+                firstFieldDIType = pruneTypedef(firstFieldDIType);
+                if (firstFieldDIType)
+                {
+                    return resolveUnionFieldDIType(M, type, firstFieldDIType, fieldDIIndex);
+                }
+            }
+        }
+        return nullptr;
     }
 
     DIType *resolveUnionField(Module &M, DICompositeType *CT, GetElementPtrInst *GEP, vector<int> indices)
@@ -2606,23 +2685,46 @@ public:
                         Type *fieldType = GEPSrcTy;
                         DIType *structFieldDIType = parentDIType;
                         ENV_DEBUG(dbgs() << "fieldType: " << *fieldType << ", parentDIType: " << getDITypeString(parentDIType) << "\n");
+                        // vector<tuple<Type *, DIType *, int>> fieldIndexStack;
                         while (fieldIndices.size() > 0)
                         {
-                            ENV_DEBUG(dbgs() << "resolving struct field at index: " << fieldIndices.front() << "\n");
+                            ENV_DEBUG(dbgs() << "while (fieldIndices.size() > 0) resolving struct field, fieldType: " << *fieldType << ", structFieldDIType: " << getDITypeString(structFieldDIType) << ", fieldIndices.front(): " << fieldIndices.front() << "\n");
                             int fieldIndex = fieldIndices.front();
-                            fieldIndices.erase(fieldIndices.begin());
                             auto prunedFieldDIType = pruneTypedef(structFieldDIType);
+                            if (prunedFieldDIType->getTag() == dwarf::DW_TAG_ptr_to_member_type)
+                            {
+                                dbgs() << "[!] sgfuzz-source-pass: error in accessing field from DW_TAG_ptr_to_member_type " << *V << "\n";
+                                return std::nullopt;
+                            }
                             auto prunedDICT = dyn_cast<DICompositeType>(prunedFieldDIType);
                             ENV_DEBUG(dbgs() << "fieldType: " << *fieldType << ", prunedDICT: " << getDITypeString(prunedDICT) << "\n");
                             if (prunedDICT->getTag() == dwarf::DW_TAG_union_type)
                             {
-                                structFieldDIType = resolveUnionField(*F->getParent(), prunedDICT, GEP, fieldIndices);
+                                // structFieldDIType = resolveUnionField(*F->getParent(), prunedDICT, GEP, fieldIndices);
+                                structFieldDIType = resolveUnionFieldDIType(F->getParent(), fieldType, prunedDICT, fieldIndex);
+                            }
+                            else if (prunedDICT->getTag() == dwarf::DW_TAG_array_type)
+                            {
+                                structFieldDIType = dyn_cast<DICompositeType>(prunedFieldDIType)->getBaseType();
                             }
                             else
                             {
-                                structFieldDIType = resolveStructFieldDIType(F->getParent(), fieldType, parentDIType, fieldIndex);
+                                structFieldDIType = resolveStructFieldDIType(F->getParent(), fieldType, prunedFieldDIType, fieldIndex);
                             }
-                            fieldType = fieldType->getStructElementType(fieldIndex);
+                            if (fieldType->isStructTy())
+                            {
+                                fieldType = fieldType->getStructElementType(fieldIndex);
+                            }
+                            else if (fieldType->isArrayTy())
+                            {
+                                fieldType = fieldType->getArrayElementType();
+                            }
+                            else
+                            {
+                                dbgs() << "[x] sgfuzz-source-pass: fieldType is not struct or array: " << *fieldType << "\n";
+                                assert(false);
+                            }
+                            fieldIndices.erase(fieldIndices.begin());
                         }
 
                         ENV_DEBUG(dbgs() << "structFieldDIType: " << getDITypeString(structFieldDIType) << "\n");
@@ -3340,6 +3442,10 @@ void collectDICompositeTypes(DIType *Type, set<DIType *> &visited, map<string, D
             {
                 collectDICompositeTypes(Member->getBaseType(), visited, map);
             }
+        }
+        if (CT->getTag() == dwarf::DW_TAG_array_type)
+        {
+            collectDICompositeTypes(CT->getBaseType(), visited, map);
         }
     }
     else if (auto *DT = dyn_cast<DIDerivedType>(Type))
