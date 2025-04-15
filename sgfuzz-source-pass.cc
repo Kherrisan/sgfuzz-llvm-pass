@@ -2630,7 +2630,8 @@ public:
                         if (structFieldDIType)
                         {
                             info.name = structFieldDIType->getName().str();
-                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(fieldType, structFieldDIType));
+                            // info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(fromTypeAndDIType(fieldType, structFieldDIType));
+                            info.type.info.pointer.pointee = std::make_unique<VarTypeInfo>(resolveVarTypeFromDIType(structFieldDIType));
                             info.DIType = pruneTypedef(structFieldDIType);
                             info.is_local = parentInfo->is_local;
                             info.is_param = parentInfo->is_param;
