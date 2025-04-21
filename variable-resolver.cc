@@ -499,6 +499,7 @@ VarTypeInfo VarInfoResolver::resolveVarTypeFromDIType(DIType *type)
     if (auto it = diTypeToVarTypeInfoCache.find(type); it != diTypeToVarTypeInfoCache.end())
     {
         ENV_DEBUG(dbgs() << "hit diTypeToVarTypeInfoCache: " << getDITypeString(type) << "\n");
+        ENV_DEBUG(dbgs() << "cache: " << it->second.to_string() << "\n");
         return it->second;
     }
 

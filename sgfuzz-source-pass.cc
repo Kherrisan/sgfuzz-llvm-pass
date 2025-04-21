@@ -53,6 +53,8 @@
 #include "variable-resolver.h"
 
 #define DEBUG_TYPE "sgfuzz-source-pass"
+#define SGFUZZ_BLOCKING_TYPE_FILE_ENV "SGFUZZ_BLOCKING_TYPE_FILE"
+#define SGFUZZ_PATCHING_TYPE_FILE_ENV "SGFUZZ_PATCHING_TYPE_FILE"
 
 using namespace llvm;
 using namespace std;
@@ -148,7 +150,7 @@ bool env_var_set(const char *env_var)
 Convert environment variable content to a set.
 Expects comma-separated list of values in the env var.
 */
-std::vector<std::string> parse_env_var_list(const char *env_var)
+std::vector<std::string> parseEnvironmentList(const char *env_var)
 {
     const char *envp = std::getenv(env_var);
     if (!envp)
@@ -230,7 +232,6 @@ public:
 
 private:
     vector<tuple<string, string>> patchingVariableWhiteList;
-    vector<string> BlacklistFiles;
     set<Value *> instrumentedValues;
 
     int ppId;
@@ -238,6 +239,7 @@ private:
     VarInfoResolver varResolver;
     vector<VariableInfo> varInfoList;
 
+    vector<string> blockingTypes;
     vector<string> patchingTypes;
 };
 
@@ -249,9 +251,9 @@ SGFuzzPass::SGFuzzPass()
 
     if (env_var_set("FT_BLACKLIST_FILES"))
     {
-        for (std::string s : parse_env_var_list("FT_BLACKLIST_FILES"))
+        for (std::string s : parseEnvironmentList("FT_BLACKLIST_FILES"))
         {
-            BlacklistFiles.push_back(s);
+            blockingTypes.push_back(s);
         }
     }
 }
@@ -271,15 +273,27 @@ PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
     M.print(OutputFile, NULL);
     OutputFile.close();
 
-    if (std::find(BlacklistFiles.begin(), BlacklistFiles.end(), M.getSourceFileName()) != BlacklistFiles.end())
+    if (std::find(blockingTypes.begin(), blockingTypes.end(), M.getSourceFileName()) != blockingTypes.end())
     {
         ENV_DEBUG(dbgs() << "FT: Ignore blacklist file: " << M.getSourceFileName() << "\n");
         return PreservedAnalyses::all();
     }
 
-    if (env_var_set("SGFUZZ_PATCHING_TYPE_FILE"))
+    if (env_var_set(SGFUZZ_BLOCKING_TYPE_FILE_ENV))
     {
-        string patchingTypeFile = getenv("SGFUZZ_PATCHING_TYPE_FILE");
+        string blockingTypeFile = getenv(SGFUZZ_BLOCKING_TYPE_FILE_ENV);
+        ifstream file(blockingTypeFile);
+        string line;
+        while (getline(file, line))
+        {
+            blockingTypes.push_back(line);
+        }
+        file.close();
+    }
+
+    if (env_var_set(SGFUZZ_PATCHING_TYPE_FILE_ENV))
+    {
+        string patchingTypeFile = getenv(SGFUZZ_PATCHING_TYPE_FILE_ENV);
         ifstream file(patchingTypeFile);
         string line;
         while (getline(file, line))
@@ -384,6 +398,32 @@ string ins2ppTy(Instruction &I)
 
 bool SGFuzzPass::shouldInstrument(VarInfo &var)
 {
+    if (!blockingTypes.empty())
+    {
+        for (auto &bt : blockingTypes)
+        {
+            if (var.type.kind == VarTypeInfo::Kind::Int && var.type.typedef_name == bt)
+            {
+                return false;
+            }
+            else if (var.type.kind == VarTypeInfo::Kind::Enum && var.type.info.enum_type.name == bt)
+            {
+                return false;
+            }
+            else if (var.type.kind == VarTypeInfo::Kind::Pointer)
+            {
+                if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Int && var.type.info.pointer.pointee->typedef_name == bt)
+                {
+                    return false;
+                }
+                else if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Enum && var.type.info.pointer.pointee->info.enum_type.name == bt)
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
     if (!patchingTypes.empty())
     {
         for (auto &pt : patchingTypes)
@@ -593,7 +633,7 @@ bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn)
     this->instrumentedValues = {};
 
     // Get functions which should not be called (i.e., for which we delete calls to)
-    auto fn_del_vec = parse_env_var_list("FT_NOP_FN");
+    auto fn_del_vec = parseEnvironmentList("FT_NOP_FN");
     std::set<std::string> fn_del(fn_del_vec.begin(), fn_del_vec.end());
     ENV_DEBUG(dbgs() << "FT: Deleting function calls to " << fn_del.size() << " functions\n");
 
