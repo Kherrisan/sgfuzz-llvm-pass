@@ -1,30 +1,22 @@
-#ifndef SGFUZZ_UTILS_H
-#define SGFUZZ_UTILS_H
+#pragma once
 
 #include <cstdlib>
 
 #define DEBUG_ENV "SGFUZZ_DEBUG"
 
-static bool checkedEnv = false;
-static const char *cachedEnv = nullptr;
+extern bool checkedEnv;
+extern bool ENV_LOG_ENABLED;
 
-inline const char *getCachedEnv(const char *varName)
-{
-    if (!checkedEnv)
-    {
-        cachedEnv = getenv(varName);
-        checkedEnv = true;
-    }
-    return cachedEnv;
-}
-
-#define ENV_DEBUG(expr)                                \
-    do                                                 \
-    {                                                  \
-        if (const char *env = getCachedEnv(DEBUG_ENV)) \
-        {                                              \
-            expr;                                      \
-        }                                              \
+#define ENV_DEBUG(expr)                                    \
+    do                                                     \
+    {                                                      \
+        if (!checkedEnv)                                   \
+        {                                                  \
+            checkedEnv = true;                             \
+            ENV_LOG_ENABLED = (getenv(DEBUG_ENV) != NULL); \
+        }                                                  \
+        if (ENV_LOG_ENABLED)                               \
+        {                                                  \
+            expr;                                          \
+        }                                                  \
     } while (0)
-
-#endif

@@ -50,7 +50,7 @@
 
 #include "llvm/BinaryFormat/Dwarf.h"
 
-#include "variable-resolver.h"
+#include "llvm-variable-resolver.h"
 
 #define DEBUG_TYPE "sgfuzz-source-pass"
 #define SGFUZZ_BLOCKING_TYPE_FILE_ENV "SGFUZZ_BLOCKING_TYPE_FILE"
@@ -189,7 +189,7 @@ public:
     std::string moduleName;
     std::string func;
     std::string insTy;
-    VarInfo varInfo;
+    pingu::VarInfo varInfo;
     std::string detail;
     string bbName;
 
@@ -223,12 +223,12 @@ public:
 
     PreservedAnalyses run(Module &M, ModuleAnalysisManager &);
     bool replaceMainFunction(Module &M);
-    void record(vector<VariableInfo> &varInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, VarInfo &var_info, uint64_t id, string detail);
+    void record(vector<VariableInfo> &varInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, pingu::VarInfo &var_info, uint64_t id, string detail);
     bool scan(Module &M, FunctionCallee &instrument_fn);
     void dumpModuleToFile(const Module &M);
     bool handleStoreInstruction(Module &M, Function *F, StoreInst *SI, vector<VariableInfo> &patchPointInfoList);
     bool instrument(vector<VariableInfo> &patchPointInfoList, Module &M, Function *F, Function *stackmap_intr);
-    bool shouldInstrument(VarInfo &varInf);
+    bool shouldInstrument(pingu::VarInfo &varInfo);
 
 private:
     vector<tuple<string, string>> patchingVariableWhiteList;
@@ -236,7 +236,7 @@ private:
 
     int ppId;
 
-    VarInfoResolver varResolver;
+    pingu::VarInfoResolver varResolver;
     vector<VariableInfo> varInfoList;
 
     vector<string> blockingTypes;
@@ -310,8 +310,7 @@ PreservedAnalyses SGFuzzPass::run(Module &M, ModuleAnalysisManager &MAM)
 
     bool ModuleModified = false;
 
-    varResolver.initGlobalVars(M);
-    varResolver.collectAllStructDITypes(M);
+    varResolver.collectDITypes(M);
 
     auto instrumentFunc = M.getOrInsertFunction(
         "__sfuzzer_instrument",
@@ -396,27 +395,28 @@ string ins2ppTy(Instruction &I)
     }
 }
 
-bool SGFuzzPass::shouldInstrument(VarInfo &var)
+bool SGFuzzPass::shouldInstrument(pingu::VarInfo &varInfo)
 {
     if (!blockingTypes.empty())
     {
         for (auto &bt : blockingTypes)
         {
-            if (var.type.kind == VarTypeInfo::Kind::Int && var.type.typedef_name == bt)
+            if (varInfo.type->kind() == pingu::Type::Kind::Int && varInfo.type->typedefName() == bt)
             {
                 return false;
             }
-            else if (var.type.kind == VarTypeInfo::Kind::Enum && var.type.info.enum_type.name == bt)
+            else if (varInfo.type->kind() == pingu::Type::Kind::Enum && static_cast<pingu::Enum *>(varInfo.type)->name() == bt)
             {
                 return false;
             }
-            else if (var.type.kind == VarTypeInfo::Kind::Pointer)
+            else if (varInfo.type->kind() == pingu::Type::Kind::Pointer)
             {
-                if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Int && var.type.info.pointer.pointee->typedef_name == bt)
+                auto pointee = static_cast<pingu::Pointer *>(varInfo.type)->pointee();
+                if (pointee->kind() == pingu::Type::Kind::Int && pointee->typedefName() == bt)
                 {
                     return false;
                 }
-                else if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Enum && var.type.info.pointer.pointee->info.enum_type.name == bt)
+                else if (pointee->kind() == pingu::Type::Kind::Enum && static_cast<pingu::Enum *>(pointee)->name() == bt)
                 {
                     return false;
                 }
@@ -428,22 +428,23 @@ bool SGFuzzPass::shouldInstrument(VarInfo &var)
     {
         for (auto &pt : patchingTypes)
         {
-            if (var.type.kind == VarTypeInfo::Kind::Int &&
-                var.type.typedef_name == pt)
+            if (varInfo.type->kind() == pingu::Type::Kind::Int &&
+                varInfo.type->typedefName() == pt)
             {
                 return true;
             }
-            else if (var.type.kind == VarTypeInfo::Kind::Enum && var.type.info.enum_type.name == pt)
+            else if (varInfo.type->kind() == pingu::Type::Kind::Enum && static_cast<pingu::Enum *>(varInfo.type)->name() == pt)
             {
                 return true;
             }
-            else if (var.type.kind == VarTypeInfo::Kind::Pointer)
+            else if (varInfo.type->kind() == pingu::Type::Kind::Pointer)
             {
-                if (var.type.info.pointer.pointee->typedef_name == pt)
+                auto pointee = static_cast<pingu::Pointer *>(varInfo.type)->pointee();
+                if (pointee->typedefName() == pt)
                 {
                     return true;
                 }
-                if (var.type.info.pointer.pointee->kind == VarTypeInfo::Kind::Enum && var.type.info.pointer.pointee->info.enum_type.name == pt)
+                if (pointee->kind() == pingu::Type::Kind::Enum && static_cast<pingu::Enum *>(pointee)->name() == pt)
                 {
                     return true;
                 }
@@ -453,7 +454,7 @@ bool SGFuzzPass::shouldInstrument(VarInfo &var)
     return false;
 }
 
-void SGFuzzPass::record(vector<VariableInfo> &patchPointInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, VarInfo &var_info, uint64_t id, string detail)
+void SGFuzzPass::record(vector<VariableInfo> &patchPointInfoList, Instruction *I, InstrumentType type, Value *V, string ppTy, pingu::VarInfo &var_info, uint64_t id, string detail)
 {
     VariableInfo info;
     info.ins = I;
@@ -566,13 +567,13 @@ bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, v
     {
         return false;
     }
-    ENV_DEBUG(dbgs() << "operand: name: " << operand->name << ", type: " << operand->type.to_string() << ", type_def: " << operand->type.typedef_name << "\n");
+    ENV_DEBUG(dbgs() << "operand: name: " << operand->name << ", type: " << operand->type->toString() << ", type_def: " << operand->type->typedefName() << "\n");
 
     if (!shouldInstrument(*var))
     {
         return false;
     }
-    dbgs() << "[+] sgfuzz-llvm-pass: Encounter store operand whose type falls within the patching types: " << var->type.to_string() << "\n";
+    dbgs() << "[+] sgfuzz-llvm-pass: Found a store operand to be instrumented: " << var->type->toString() << "\n";
 
     if (!SI->getOperand(0)->getType()->isIntegerTy())
     {
@@ -581,12 +582,6 @@ bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, v
     }
 
     auto target = SI->getOperand(0);
-    if (instrumentedValues.count(target) || dyn_cast<ConstantInt>(target))
-    {
-        // 如果 target 已经被 instrument 过，并且不是常量，则不 instrument
-        // 对于常量，都要 instrument
-        return false;
-    }
 
     uint64_t id = ppId++;
     ENV_DEBUG(dbgs() << "Instrumenting store instruction: " << id << " " << *SI << "\n");
@@ -654,8 +649,6 @@ bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn)
             continue;
 
         vector<VariableInfo> funcVarInfoList;
-
-        varResolver.collectFunctionLocalVars(F);
 
         for (auto &B : F)
         {

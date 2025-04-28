@@ -14,7 +14,7 @@ TARGETS = sgfuzz-source-pass.so
 
 all: $(TARGETS)
 
-sgfuzz-source-pass.so: sgfuzz-source-pass.cc variable-resolver.cc
+sgfuzz-source-pass.so: sgfuzz-source-pass.cc llvm-variable-resolver.cc llvm-variable-type.cc llvm-utils.cc utils.cc
 	$(CXX) $(CLANG_CFL) -fPIC -shared -Wswitch -Wno-deprecated-declarations $^ -o $@ $(CLANG_LFL)
 
 clean:
