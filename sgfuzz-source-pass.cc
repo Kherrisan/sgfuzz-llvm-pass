@@ -567,13 +567,13 @@ bool SGFuzzPass::handleStoreInstruction(Module &M, Function *F, StoreInst *SI, v
     {
         return false;
     }
-    ENV_DEBUG(dbgs() << "operand: name: " << operand->name << ", type: " << operand->type->toString() << ", type_def: " << operand->type->typedefName() << "\n");
+    ENV_DEBUG(dbgs() << "operand: " << operand->to_json().dump(4) << "\n");
 
     if (!shouldInstrument(*var))
     {
         return false;
     }
-    dbgs() << "[+] sgfuzz-llvm-pass: Found a store operand to be instrumented: " << var->type->toString() << "\n";
+    dbgs() << "[+] sgfuzz-llvm-pass: Found a store operand to be instrumented: " << *SI << " -> " << var->type->toString() << "\n";
 
     if (!SI->getOperand(0)->getType()->isIntegerTy())
     {
@@ -640,6 +640,8 @@ bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn)
 
     for (auto &F : M)
     {
+        bool log_enabled_backup = ENV_LOG_ENABLED;
+
         if (totalFuncs > 10 && ++progress % (totalFuncs / 10) == 0)
             dbgs() << "[+] sgfuzz-llvm-pass: Functions instrumenting progress: " << progress << "/" << totalFuncs << "(" << (progress * 100 / totalFuncs) << "%)\n";
 
@@ -669,6 +671,8 @@ bool SGFuzzPass::scan(Module &M, FunctionCallee &instrument_fn)
         }
 
         instrument(funcVarInfoList, M, &F, instrument_fn_func);
+
+        ENV_LOG_ENABLED = log_enabled_backup;
     }
     LLVM_DEBUG(ENV_DEBUG(dbgs() << "FT: Inserted " << num_patchpoints << " patchpoints\n"));
 

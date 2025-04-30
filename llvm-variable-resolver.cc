@@ -35,6 +35,18 @@ namespace pingu
         }
 
         auto opType = Type::fromType(M, type);
+        if (!opType)
+        {
+            // unrecognized operation type
+            // like: <2 x i32>
+            dbgs() << "[!] sgfuzz-llvm-pass: unrecognized operation type: " << *type << "\n";
+            return std::nullopt;
+        }
+        if (opType->kind() == Type::Kind::Struct)
+        {
+            auto structType = static_cast<Struct *>(opType);
+            opType = Type::fromName(structType->name());
+        }
         ENV_DEBUG(dbgs() << "interpret opType: " << opType->toString() << ", var: " << var.type->toString() << "\n");
 
         if (type->isVectorTy())
@@ -45,8 +57,15 @@ namespace pingu
         if (var.type->isIndexable())
         {
             auto indexedType = static_cast<IndexedType *>(var.type);
+            if (indexedType->isFromType(opType) && indexedType->kind() == IndexedType::Kind::Struct)
+            {
+                auto structType = static_cast<Struct *>(indexedType);
+                indexedType = static_cast<Struct *>(Type::fromName(structType->name()));
+            }
             std::vector<Member> memberRefs;
-            auto interpretedType = indexedType->interpreteAs(opType, memberRefs);
+            // TODO: empty name
+            std::string name;
+            auto interpretedType = indexedType->interpreteAs(opType, memberRefs, name);
             if (interpretedType)
             {
                 VarInfo interpretedVar = var;
@@ -58,8 +77,8 @@ namespace pingu
                     for (int i = memberRefs.size() - 1; i >= 0; i--)
                     {
                         auto member = std::make_unique<VarInfo>();
-                        member->name = std::get<0>(memberRefs[i]);
-                        member->type = std::get<1>(memberRefs[i]);
+                        member->name = std::get<0>(memberRefs.at(i));
+                        member->type = std::get<1>(memberRefs.at(i));
                         member->is_local = var.is_local;
                         member->is_global = var.is_global;
                         member->is_param = var.is_param;
@@ -209,59 +228,91 @@ namespace pingu
         {
             for (Instruction &I : BB)
             {
-                if (auto *DI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
+                if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(&I))
+                {
+                    VarInfo info;
+                    info.name = instructionValueName(AI);
+                    auto M = AI->getParent()->getParent()->getParent();
+                    auto allocaTy = Type::fromType(M, AI->getAllocatedType());
+                    info.type = Type::fromTypeID(new Pointer(allocaTy));
+                    info.is_local = true;
+                    info.is_param = false;
+                    info.is_global = false;
+                    valueVarInfoCache[AI] = info;
+                }
+                else if (auto *DI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
                 {
                     if (auto *AI = dyn_cast<llvm::AllocaInst>(DI->getAddress()))
                     {
-                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars via DbgDeclareInst: " << *AI << "\n");
                         VarInfo info;
                         info.name = DI->getVariable()->getName().str();
-                        auto ty = Type::fromDIType(DI->getVariable()->getType());
-                        if (F.getName().str() == "wc_OBJ_sn2nid")
-                        {
-                            ENV_DEBUG(dbgs() << "collectFunctionLocalVars wc_OBJ_sn2nid: " << ty->toJson().dump() << "\n");
-                        }
-                        info.type = Type::fromTypeID(new Pointer(ty));
+                        info.type = Type::fromDIType(DI->getVariable()->getType());
+                        info.type = Type::fromTypeID(new Pointer(info.type));
                         info.is_local = true;
                         info.is_param = false;
                         info.is_global = false;
                         valueVarInfoCache[AI] = info;
+                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars: " << *AI << " -> " << info.type->toString() << "\n");
                     }
                 }
                 else if (auto *AI = llvm::dyn_cast<llvm::DbgAssignIntrinsic>(&I))
                 {
                     if (auto *V = AI->getAddress())
                     {
-                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars via DbgAssignIntrinsic: " << *AI << "\n");
                         VarInfo info;
                         info.name = AI->getVariable()->getName().str();
-                        info.type = Type::fromDIType(AI->getVariable()->getType());
+                        auto assignType = Type::fromDIType(AI->getVariable()->getType());
+                        if (auto allocType = llvm::dyn_cast<llvm::AllocaInst>(V))
+                        {
+                            info.type = Type::fromTypeID(new Pointer(assignType));
+                        }
+                        else
+                        {
+                            info.type = assignType;
+                        }
+                        auto exprMeta = llvm::cast<llvm::MetadataAsValue>(AI->getArgOperand(2))->getMetadata();
+                        if (auto expr = llvm::dyn_cast<llvm::DIExpression>(exprMeta))
+                        {
+                            ENV_DEBUG(dbgs() << "DbgAssignIntrinsic, DIExpression: " << *expr << "\n");
+                            if (expr->getNumElements() > 0 && expr->getElement(0) == llvm::dwarf::DW_OP_LLVM_fragment)
+                            {
+                                // auto valueName = instructionValueName(AI->getArgOperand(4));
+                                // int offset = expr->getElement(1);
+                                // int width = expr->getElement(2);
+                                // ENV_DEBUG(dbgs() << "DbgAssignIntrinsic, DW_OP_LLVM_fragment, valueName: " << valueName << ", offset: " << offset << ", width: " << width << "\n");
+                                // std::vector<Member> memberRefs;
+                                // auto fieldType = static_cast<IndexedType *>(assignType)->index(width, offset, memberRefs, valueName);
+                                // auto field = join(info, memberRefs);
+                                continue;
+                            }
+                        }
                         info.is_local = true;
                         info.is_param = false;
                         info.is_global = false;
                         valueVarInfoCache[V] = info;
+                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars: " << *AI << " -> " << info.type->toString() << "\n");
                     }
                 }
                 else if (auto *VI = llvm::dyn_cast<llvm::DbgValueInst>(&I))
                 {
-                    // 对于 llvm.dbg.value 和 llvm.dbg.assign 指令
+                    // 对于 llvm.dbg.value
                     if (auto *V = VI->getValue())
                     {
-                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars via DbgValueInst: " << *VI << "\n");
                         VarInfo info;
                         info.name = VI->getVariable()->getName().str();
                         info.type = Type::fromDIType(VI->getVariable()->getType());
+                        if (auto allocType = llvm::dyn_cast<llvm::AllocaInst>(V))
+                        {
+                            info.type = Type::fromTypeID(new Pointer(info.type));
+                        }
                         info.is_local = true;
                         info.is_param = false;
                         info.is_global = false;
                         valueVarInfoCache[V] = info;
+                        // ENV_DEBUG(dbgs() << "collectFunctionLocalVars: " << *VI << " -> " << info.type->toString() << "\n");
                     }
                 }
             }
-        }
-        if (F.getName().str() == "wc_OBJ_sn2nid")
-        {
-            // exit(0);
         }
     }
 
@@ -281,7 +332,6 @@ namespace pingu
 
     void VarInfoResolver::collectFunctionParams(llvm::Function &F)
     {
-        ENV_DEBUG(dbgs() << "collectFunctionParams: " << F.getName() << "\n");
         if (llvm::DISubprogram *SP = F.getSubprogram())
         {
             if (auto *subRoutineType = llvm::dyn_cast<llvm::DISubroutineType>(SP->getType()))
@@ -403,7 +453,7 @@ namespace pingu
             parentPointee.type = Type::fromName(name);
             if (!parentPointee.type)
             {
-                ENV_DEBUG(dbgs() << "Failed to find definition of: " << name << "\n");
+                ENV_DEBUG(dbgs() << "Failed to find definition of: '" << name << "'\n");
                 return std::nullopt;
             }
         }
@@ -503,16 +553,16 @@ namespace pingu
 
         auto M = GEP->getParent()->getParent()->getParent();
         auto gepSrcType = Type::fromType(M, GEP->getSourceElementType());
-        auto resolvedType = static_cast<Pointer *>(parent->type)->pointee();
         ENV_DEBUG(dbgs() << "resolveGEP parent: " << parent->type->toString() << "\n");
-        if (resolvedType->isDeclaration())
+        auto resolvedType = static_cast<Pointer *>(parent->type)->pointee();
+        if (resolvedType->isDeclaration() || Type::isFromType(resolvedType))
         {
             std::string name = resolvedType->name();
             resolvedType = Type::fromName(name);
             if (!resolvedType)
             {
-                ENV_DEBUG(dbgs() << "Failed to find definition of: " << name << "\n");
-                assert(false);
+                dbgs() << "[!] sgfuzz-llvm-pass: Failed to find definition of: '" << name << "'\n";
+                return std::nullopt;
             }
         }
         assert(resolvedType);
@@ -527,6 +577,14 @@ namespace pingu
             {
                 index = CI->getZExtValue();
             }
+            else
+            {
+                // TODO:
+                // non-constant index in GEP
+                // require the gepSrcType and resolvedType's element type are the same size
+                // int resolvedElemTySz;
+                // if (resolvedT)
+            }
             ENV_DEBUG(dbgs() << "resolveGEP operand 1 index: " << index << "\n");
             assert(resolvedType);
             if (resolvedType->isIndexable())
@@ -538,21 +596,33 @@ namespace pingu
                 // GEP i32[8], i32[8]* %0, 8
                 //     => gepSrcType is i32[8][9], resolvedType is i32[8][9]
                 //     => index the 8th i32[8] of gepSrcType in the resolvedType i32[8][1]
-                if (resolvedType->isDeclaration())
+                if (resolvedType->isDeclaration() || Type::isFromType(resolvedType))
                 {
                     auto name = resolvedType->name();
                     resolvedType = Type::fromName(name);
                     if (!resolvedType)
                     {
-                        ENV_DEBUG(dbgs() << "Failed to find definition of: " << name << "\n");
+                        ENV_DEBUG(dbgs() << "Failed to find definition of: '" << name << "'\n");
                         assert(false);
                     }
                 }
                 gepSrcType = Type::fromTypeID(new Array(gepSrcType, index + 1));
                 resolvedType = Type::fromTypeID(new Array(resolvedType, index + 1));
                 std::vector<Member> memberRefs;
-                resolvedType = static_cast<IndexedType *>(resolvedType)->indexAs(gepSrcType, index, memberRefs, gepValueName);
-                gepSrcType = static_cast<IndexedType *>(gepSrcType)->index(index);
+                auto resolvedFieldType = static_cast<IndexedType *>(resolvedType)->indexAs(gepSrcType, index, memberRefs, gepValueName);
+                if (!resolvedFieldType)
+                {
+                    ENV_DEBUG(dbgs() << "[!] Failed to gep " << index << " of " << gepSrcType->toString() << ", in " << resolvedType->toString() << "\n");
+                    return std::nullopt;
+                }
+                resolvedType = resolvedFieldType;
+                auto gepSrcFieldType = static_cast<IndexedType *>(gepSrcType)->index(index);
+                if (!gepSrcFieldType)
+                {
+                    ENV_DEBUG(dbgs() << "[!] Failed to index " << index << " in " << gepSrcType->toString() << "\n");
+                    return std::nullopt;
+                }
+                gepSrcType = gepSrcFieldType;
             }
             else
             {
@@ -572,18 +642,43 @@ namespace pingu
                     index = CI->getZExtValue();
                 }
                 ENV_DEBUG(dbgs() << "resolveGEP operand " << i << " index: " << index << "\n");
-                if (resolvedType->isDeclaration())
+                if (resolvedType->isDeclaration() || (resolvedType->kind() == Type::Kind::Struct && Type::isFromType(resolvedType)))
                 {
                     auto name = resolvedType->name();
-                    resolvedType = Type::fromName(name);
-                    if (!resolvedType)
+                    auto typeDef = Type::fromName(name);
+                    if (!typeDef)
                     {
-                        ENV_DEBUG(dbgs() << "Failed to find definition of: " << name << "\n");
-                        assert(false);
+                        ENV_DEBUG(dbgs() << "Failed to find definition of: '" << name << "'\n");
+                    }
+                    else
+                    {
+                        resolvedType = typeDef;
                     }
                 }
+                if (!resolvedType->isIndexable())
+                {
+                    dbgs() << "[!] sgfuzz-llvm-pass: Type is not indexable: '" << resolvedType->toString() << "'\n";
+                    return std::nullopt;
+                }
+                // dbgs() << "resolvedType: " << resolvedType->toDebugJson().dump(4) << "\n";
                 auto indexedType = static_cast<IndexedType *>(resolvedType);
                 resolvedType = indexedType->indexAs(gepSrcType, index, memberRefs, gepValueName, bitfieldTy);
+                if (!resolvedType)
+                {
+                    ENV_DEBUG(dbgs() << "[!] Failed to gep " << index << " of " << gepSrcType->toString() << ", in " << indexedType->toString() << "\n");
+                    return std::nullopt;
+                }
+                gepSrcType = static_cast<IndexedType *>(gepSrcType)->index(index);
+                if (!gepSrcType)
+                {
+                    ENV_DEBUG(dbgs() << "[!] Failed to index " << index << " in " << gepSrcType->toString() << "\n");
+                    return std::nullopt;
+                }
+                if (resolvedType->kind() == Type::Kind::Union && i < GEP->getNumOperands() - 1)
+                {
+                    // union is only supported for the last index
+                    return std::nullopt;
+                }
             }
         }
 
@@ -593,6 +688,7 @@ namespace pingu
         {
             VarInfo fieldPtr(*field);
             fieldPtr.type = Type::fromTypeID(new Pointer(field->type));
+            ENV_DEBUG(dbgs() << "resolveGEP store to cache: " << *GEP << " -> type: " << fieldPtr.type->toString() << "\n");
             valueVarInfoCache[GEP] = fieldPtr;
             return fieldPtr;
         }
@@ -617,12 +713,33 @@ namespace pingu
             return std::nullopt;
         }
         std::vector<Member> memberRefs;
-        auto actualType = ptrType->pointee()->interpreteAs(opType, memberRefs);
-        ENV_DEBUG(dbgs() << "interpreteAs: " << ptrType->pointee()->toString() << " -> " << actualType->toString() << "\n");
+        Type *actualType = nullptr;
+        std::string loadValueName = instructionValueName(LI);
+        auto pointee = ptrType->pointee();
+        ENV_DEBUG(dbgs() << "resolveLoad pointee: " << pointee->toString() << "\n");
+        if (pointee->isDeclaration())
+        {
+            auto name = pointee->name();
+            pointee = Type::fromName(name);
+            if (!pointee)
+            {
+                dbgs() << "[!] sgfuzz-llvm-pass: Failed to find definition of: '" << name << "'\n";
+                return std::nullopt;
+            }
+        }
+        if (pointee->isIndexable())
+        {
+            actualType = static_cast<IndexedType *>(pointee)->interpreteAs(opType, memberRefs, loadValueName);
+        }
+        else
+        {
+            actualType = pointee->interpreteAs(opType, memberRefs, loadValueName);
+        }
         if (!actualType)
         {
             return std::nullopt;
         }
+        ENV_DEBUG(dbgs() << "interpreteAs: " << ptrType->pointee()->toString() << " -> " << actualType->toString() << "\n");
         if (memberRefs.size() > 0)
         {
             auto info = join(*ptrOperand, memberRefs);
@@ -670,34 +787,46 @@ namespace pingu
     std::optional<VarInfo> VarInfoResolver::resolveVarInfo(llvm::Value *V, llvm::Function *F)
     {
         ENV_DEBUG(dbgs() << "resolveVarInfo: " << *V << "\n");
-        if (auto it = valueVarInfoCache.find(V); it != valueVarInfoCache.end())
+        if (valueVarInfoCache.find(V) != valueVarInfoCache.end())
         {
-            // ENV_DEBUG(dbgs() << "resolved from cache: " << it->second.name << ", type: " << it->second.type->toString() << "\n");
-            return it->second;
+            auto var = valueVarInfoCache[V];
+            ENV_DEBUG(dbgs() << "resolved from cache: " << var.name << " -> " << var.type->toString() << "\n");
+            return var;
         }
-
         if (auto *ZEXT = llvm::dyn_cast<llvm::ZExtInst>(V))
         {
             auto var = resolveVarInfo(ZEXT->getOperand(0), F);
-            ENV_DEBUG(dbgs() << "resolved: " << *ZEXT << " -> type: " << var->type->toString() << "\n");
+            if (var)
+            {
+                ENV_DEBUG(dbgs() << "resolved: " << *ZEXT << " -> type: " << var->type->toString() << "\n");
+            }
             return var;
         }
         else if (auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(V))
         {
             auto var = resolveGEP(GEP);
-            ENV_DEBUG(dbgs() << "resolved: " << *GEP << " -> type: " << var->type->toString() << "\n");
+            if (var)
+            {
+                ENV_DEBUG(dbgs() << "resolved: " << *GEP << " -> type: " << var->type->toString() << "\n");
+            }
             return var;
         }
         else if (auto *LI = llvm::dyn_cast<llvm::LoadInst>(V))
         {
             auto var = resolveLoad(LI);
-            ENV_DEBUG(dbgs() << "resolved: " << *LI << " -> type: " << var->type->toString() << "\n");
+            if (var)
+            {
+                ENV_DEBUG(dbgs() << "resolved: " << *LI << " -> type: " << var->type->toString() << "\n");
+            }
             return var;
         }
         else if (auto *PHI = llvm::dyn_cast<llvm::PHINode>(V))
         {
             auto var = resolvePHI(PHI);
-            ENV_DEBUG(dbgs() << "resolved: " << *PHI << " -> type: " << var->type->toString() << "\n");
+            if (var)
+            {
+                ENV_DEBUG(dbgs() << "resolved: " << *PHI << " -> type: " << var->type->toString() << "\n");
+            }
             return var;
         }
         else

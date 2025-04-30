@@ -9,6 +9,30 @@ namespace pingu
     std::vector<llvm::DIType *> Type::m_diTypeParsingStack = {};
     std::vector<Type *> Type::m_declarationTypes = {};
 
+    bool Type::isFromType(Type *type)
+    {
+        for (auto &[llvmType, cachedType] : m_typeCache)
+        {
+            if (cachedType == type)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool Type::isFromDIType(Type *type)
+    {
+        for (auto &[diType, cachedType] : m_diTypeCache)
+        {
+            if (cachedType == type)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     Type *Type::fromName(std::string name)
     {
         ENV_DEBUG(dbgs() << "fromName: " << name << "\n");
@@ -53,7 +77,8 @@ namespace pingu
         }
         else
         {
-            assert(false && "Unsupported type");
+            // For other types, like vector (<2 x i32>), we do not support them yet
+            return nullptr;
         }
 
         m_typeCache[llvmType] = type;
@@ -85,13 +110,6 @@ namespace pingu
         m_diTypeParsingStack.push_back(diType);
         if (auto *derivedDIType = llvm::dyn_cast<llvm::DIDerivedType>(diType))
         {
-            if (derivedDIType->getTag() == llvm::dwarf::DW_TAG_ptr_to_member_type)
-            {
-                // If the member is a pointer to a member function, return a pointer to void
-                m_diTypeParsingStack.pop_back();
-                int size = derivedDIType->getSizeInBits();
-                return fromTypeID(new Other("DW_TAG_ptr_to_member_type", size));
-            }
             if (derivedDIType->getTag() == llvm::dwarf::DW_TAG_member && derivedDIType->getFlags() & llvm::DINode::FlagBitField)
             {
                 auto type = new Bitfield(derivedDIType->getOffsetInBits(), derivedDIType->getSizeInBits());
@@ -110,7 +128,14 @@ namespace pingu
         }
         else if (auto derivedType = llvm::dyn_cast<llvm::DIDerivedType>(diType))
         {
-            if (derivedType->getTag() == llvm::dwarf::DW_TAG_pointer_type || derivedType->getTag() == llvm::dwarf::DW_TAG_reference_type)
+            if (derivedType->getTag() == llvm::dwarf::DW_TAG_ptr_to_member_type)
+            {
+                // If the member is a pointer to a member function, return a pointer to void
+                m_diTypeParsingStack.pop_back();
+                int size = derivedType->getSizeInBits();
+                return fromTypeID(new Other("DW_TAG_ptr_to_member_type", size));
+            }
+            if (derivedType->getTag() == llvm::dwarf::DW_TAG_pointer_type || derivedType->getTag() == llvm::dwarf::DW_TAG_reference_type || derivedType->getTag() == llvm::dwarf::DW_TAG_rvalue_reference_type)
             {
                 type = new Pointer(Type::fromDIType(derivedType->getBaseType()));
             }
@@ -188,6 +213,10 @@ namespace pingu
             assert(false && "Unsupported DIType");
         }
         type->m_typedefName = typedefName;
+        if (!typedefName.empty())
+        {
+            m_namedStructCache[typedefName] = type;
+        }
         m_diTypeCache[diType] = type;
         m_idCache[type->id()] = type;
         m_diTypeParsingStack.pop_back();
@@ -222,11 +251,11 @@ namespace pingu
         return false;
     }
 
-    Type *Type::interpreteAs(Type *other, std::vector<Member> &memberRefs)
+    Type *Type::interpreteAs(Type *other, std::vector<Member> &memberRefs, std::string &loadValueName)
     {
         if (other == &Pointer::OPAQUE_POINTER)
         {
-            if (this->kind() == Type::Kind::Pointer)
+            if (kind() == Kind::Pointer)
             {
                 return this;
             }
@@ -251,7 +280,7 @@ namespace pingu
             return static_cast<const Enum *>(this)->name();
         default:
             ENV_DEBUG(dbgs() << "Type without name: " << toString() << "\n");
-            assert(false);
+            return "";
         }
     }
 
@@ -286,13 +315,13 @@ namespace pingu
 
     int IndexedType::count() const { return m_count; }
 
-    int IndexedType::offset(int index) const { return m_offsets[index]; }
+    int IndexedType::offset(int index) const { return m_offsets.at(index); }
 
     int IndexedType::offsetIndex(int offset) const
     {
         for (int i = m_count - 1; i >= 0; i--)
         {
-            if (m_offsets[i] <= offset)
+            if (m_offsets.at(i) <= offset)
             {
                 return i;
             }
@@ -312,46 +341,68 @@ namespace pingu
         return nullptr;
     }
 
-    Type *IndexedType::index(Type *targetField, int width, int offset, std::vector<Member> &memberRefs, std::string &gepValueName)
+    Type *IndexedType::index(int targetWidth, int targetOffset, std::vector<Member> &memberRefs, std::string &gepValueName, Type *targetField)
     {
-        assert(offset >= 0);
+        assert(targetOffset >= 0);
+        assert(this->isIndexable());
         for (int i = 0; i < count(); i++)
         {
             int fieldOffset = this->offset(i);
             auto field = index(i);
+            if (!field)
+            {
+                ENV_DEBUG(dbgs() << "[!] Failed to index " << i << "th field of " << toString() << "\n");
+                return nullptr;
+            }
+            ENV_DEBUG(dbgs() << "index field: " << field->toString() << "\n");
+
             if (field->isDeclaration())
             {
-                field = Type::fromName(field->name());
-                if (!field)
+                auto typeDef = Type::fromName(field->name());
+                if (!typeDef)
                 {
-                    ENV_DEBUG(dbgs() << "index failed to find definition of: " << field->name() << "\n");
-                    assert(false);
+                    dbgs() << "[!] sg-source-pass: failed to find definition of: '" << field->name() << "'\n";
                 }
-                replaceIndex(i, field);
+                else
+                {
+                    replaceIndex(i, typeDef);
+                    field = typeDef;
+                }
             }
             int fieldWidth = field->size();
+            if (field->isIndexable() && !field->isDeclaration())
+            {
+                auto indexedType = static_cast<IndexedType *>(field);
+                int lastIdx = indexedType->count() - 1;
+                fieldWidth = indexedType->offset(lastIdx) + indexedType->index(lastIdx)->size();
+            }
             auto fieldName = indexName(i);
-            ENV_DEBUG(dbgs() << "index fieldOffset: " << fieldOffset << ", fieldWidth: " << fieldWidth << "\n");
+            ENV_DEBUG(dbgs() << "index fieldName: " << fieldName << ", fieldOffset: " << fieldOffset << ", fieldWidth: " << fieldWidth << "\n");
             if (fieldWidth <= 0)
             {
                 // This field is an array of unknown dimension size.
-                fieldWidth = width;
+                fieldWidth = targetWidth;
             }
-            if (fieldOffset <= offset && offset < fieldOffset + fieldWidth)
+            if (fieldOffset <= targetOffset && targetOffset < fieldOffset + fieldWidth)
             {
                 // the field indexed falls within [offset, offset + width)
-                if (isPrefixWithOnlyDigits(fieldName, gepValueName) || fieldWidth == width)
+                if (isPrefixWithOnlyDigits(fieldName, gepValueName) || fieldWidth == targetWidth)
                 {
                     // this type and other type are matched
-                    ENV_DEBUG(dbgs() << "index matched: offset: " << fieldOffset << ", size: " << fieldWidth << ", type: " << index(i)->toString() << "\n");
+                    ENV_DEBUG(dbgs() << "index matched, fieldName: " << fieldName << ", offset: " << fieldOffset << ", size: " << fieldWidth << ", type: " << index(i)->toString() << "\n");
                     if (fieldName.find(ARRAY_INDEXED_NAME) == std::string::npos)
                     {
-                        // We do not record the array indexing as field
                         memberRefs.push_back(std::make_tuple(fieldName, field));
+                    }
+                    else if (memberRefs.size() > 0)
+                    {
+                        // this is an array, and field is the array element
+                        auto [arrayName, arrayType] = memberRefs.back();
+                        memberRefs.push_back(std::make_tuple(arrayName, field));
                     }
                     return field;
                 }
-                else if (fieldWidth > width && field->isIndexable())
+                else if (targetWidth < fieldWidth && field->isIndexable())
                 {
                     // the field indexed falls within [offset, offset + width)
                     // which is wider than the field indexed
@@ -360,13 +411,18 @@ namespace pingu
                     // => indexAs({ptr, ptr}, 64, 64 - 64)
                     if (fieldName.find(ARRAY_INDEXED_NAME) == std::string::npos)
                     {
-                        // We do not record the array indexing as field
                         memberRefs.push_back(std::make_tuple(fieldName, field));
                     }
+                    else if (memberRefs.size() > 0)
+                    {
+                        // this is an array, and field is the array element
+                        auto [arrayName, arrayType] = memberRefs.back();
+                        memberRefs.push_back(std::make_tuple(arrayName, field));
+                    }
                     auto fieldIndexable = static_cast<IndexedType *>(field);
-                    return fieldIndexable->index(targetField, width, offset - fieldOffset, memberRefs, gepValueName);
+                    return fieldIndexable->index(targetWidth, targetOffset - fieldOffset, memberRefs, gepValueName, targetField);
                 }
-                else
+                else if (targetField)
                 {
                     // fieldWidth is smaller than width
                     // or the field is not indexable
@@ -374,17 +430,28 @@ namespace pingu
                     memberRefs.push_back(std::make_tuple(fieldName, targetField));
                     return targetField;
                 }
+                else
+                {
+                    assert(false && "Failed to index target field");
+                }
+            }
+            else if (fieldOffset > targetOffset)
+            {
+                ENV_DEBUG(dbgs() << "[!] Found index field offset greater than target offset\n");
+                ENV_DEBUG(dbgs() << "[!] Missing the target offset in field list\n");
+                return nullptr;
             }
         }
-        assert(false && "Failed to index target field");
+        ENV_DEBUG(dbgs() << "[!] Failed to index target field\n");
+        return nullptr;
     }
 
     Type *IndexedType::indexAs(Type *other, int idx, std::vector<Member> &memberRefs, std::string &gepValueName, std::optional<Type *> bitfield)
     {
         ENV_DEBUG(dbgs() << "indexAs other type: " << other->toString() << ", idx: " << idx << "\n");
         ENV_DEBUG(dbgs() << "indexAs this type: " << toString() << "\n");
-        ENV_DEBUG(dbgs() << "indexAs this is declaration: " << isDeclaration() << "\n");
 
+        // TODO: remove this check ?
         if (other->isDeclaration())
         {
             ENV_DEBUG(dbgs() << "indexAs other is declaration\n");
@@ -392,13 +459,18 @@ namespace pingu
             other = Type::fromName(other->name());
             if (!other)
             {
-                ENV_DEBUG(dbgs() << "indexAs failed to find definition of: " << name << "\n");
+                ENV_DEBUG(dbgs() << "indexAs failed to find definition of: '" << name << "'\n");
                 return nullptr;
             }
         }
         auto indexable = static_cast<IndexedType *>(other);
         assert(indexable);
         auto targetField = indexable->index(idx);
+        if (!targetField)
+        {
+            ENV_DEBUG(dbgs() << "[!] Failed to index " << idx << "th field of " << indexable->toString() << "\n");
+            return nullptr;
+        }
         auto targetOffset = indexable->offset(idx);
         auto targetWidth = targetField->size();
         // TODO: remove this check ?
@@ -406,7 +478,7 @@ namespace pingu
         {
             return this;
         }
-        ENV_DEBUG(dbgs() << "index target field: " << targetField->toString() << ", target offset: " << targetOffset << ", target width: " << targetWidth << "\n");
+        ENV_DEBUG(dbgs() << "indexAs target field: " << targetField->toString() << ", target offset: " << targetOffset << ", target width: " << targetWidth << "\n");
         if (bitfield)
         {
             targetWidth = static_cast<Bitfield *>(*bitfield)->width();
@@ -421,7 +493,12 @@ namespace pingu
             // TODO:
             return this;
         }
-        auto fieldType = index(targetField, targetWidth, targetOffset, memberRefs, gepValueName);
+        auto fieldType = index(targetWidth, targetOffset, memberRefs, gepValueName, targetField);
+        if (!fieldType)
+        {
+            ENV_DEBUG(dbgs() << "[!] Failed to index the field(name: " << gepValueName << ", width: " << targetWidth << ", offset: " << targetOffset << ") in " << toString() << "\n");
+            return nullptr;
+        }
         if (bitfield && fieldType->kind() == Type::Kind::Bitfield)
         {
             auto [fieldName, fieldType] = memberRefs.back();
@@ -431,7 +508,7 @@ namespace pingu
         return fieldType;
     }
 
-    Type *IndexedType::interpreteAs(Type *other, std::vector<Member> &memberRefs)
+    Type *IndexedType::interpreteAs(Type *other, std::vector<Member> &memberRefs, std::string &loadValueName)
     {
         ENV_DEBUG(dbgs() << "interpreteAs: " << other->toString() << "\n");
         if (other->isDeclaration())
@@ -451,6 +528,11 @@ namespace pingu
                     return nullptr;
                 }
                 Type *firstMemberType = index(0);
+                if (!firstMemberType)
+                {
+                    ENV_DEBUG(dbgs() << "[!] Failed to index 0th field of " << toString() << "\n");
+                    return nullptr;
+                }
                 if (firstMemberType->size() < other->size())
                 {
                     return nullptr;
@@ -463,7 +545,7 @@ namespace pingu
                 else
                 {
                     memberRefs.push_back(std::make_tuple(indexName(0), firstMemberType));
-                    auto child = indexIndexable(0)->interpreteAs(other, memberRefs);
+                    auto child = indexIndexable(0)->interpreteAs(other, memberRefs, loadValueName);
                     if (!child)
                     {
                         memberRefs.pop_back();
@@ -488,7 +570,17 @@ namespace pingu
                 for (int i = 0; i < otherIndexable->count(); i++)
                 {
                     auto otherMemberType = otherIndexable->index(i);
+                    if (!otherMemberType)
+                    {
+                        ENV_DEBUG(dbgs() << "[!] Failed to index " << i << "th field of " << other->toString() << "\n");
+                        return nullptr;
+                    }
                     auto thisMemberType = thisIndexable->index(i);
+                    if (!thisMemberType)
+                    {
+                        ENV_DEBUG(dbgs() << "[!] Failed to index " << i << "th field of " << toString() << "\n");
+                        return nullptr;
+                    }
                     if (offset(i) == otherIndexable->offset(i) && thisMemberType->size() == otherMemberType->size())
                     {
                         continue;
@@ -505,7 +597,7 @@ namespace pingu
                 {
                     // try to interprete the first field of this type as the other type
                     memberRefs.push_back(std::make_tuple(indexName(0), thisIndexable->index(0)));
-                    auto child = thisIndexable->indexIndexable(0)->interpreteAs(other, memberRefs);
+                    auto child = thisIndexable->indexIndexable(0)->interpreteAs(other, memberRefs, loadValueName);
                     if (!child)
                     {
                         memberRefs.pop_back();
@@ -722,7 +814,7 @@ namespace pingu
         ENV_DEBUG(dbgs() << "Array::Array(llvm::DICompositeType *diCT, std::vector<int> &dimensions): " << getDITypeString(diCT) << "\n");
         ENV_DEBUG(dbgs() << "dimensions: "; for (auto d : dimensions) { dbgs() << d << " "; } dbgs() << "\n");
         assert(diCT->getTag() == llvm::dwarf::DW_TAG_array_type);
-        m_count = dimensions[0];
+        m_count = dimensions.at(0);
         dimensions.erase(dimensions.begin());
         if (dimensions.size() > 0)
         {
@@ -858,7 +950,15 @@ namespace pingu
                 // If the member is a DISubprogram, we skip it
                 continue;
             }
-            if (structMember->getTag() == llvm::dwarf::DW_TAG_inheritance && structMember->getSizeInBits() == 8)
+            if (structMember->getTag() == llvm::dwarf::DW_TAG_inheritance)
+            {
+                auto inheritanceTy = llvm::dyn_cast<llvm::DICompositeType>(structMember->getBaseType());
+                if (inheritanceTy && inheritanceTy->getSizeInBits() <= 8)
+                {
+                    continue;
+                }
+            }
+            if (structMember->getFlags() & llvm::DINode::FlagStaticMember)
             {
                 continue;
             }
@@ -889,41 +989,43 @@ namespace pingu
 
     Type *Struct::replaceIndex(int index, Type *newType)
     {
-        auto oldType = std::get<1>(m_members[index]);
-        std::get<1>(m_members[index]) = newType;
+        auto oldType = std::get<1>(m_members.at(index));
+        std::get<1>(m_members.at(index)) = newType;
         return oldType;
     }
 
+    // TODO: based on the number of elements, we can determine if it is a declaration
     bool Struct::isDeclaration() const { return m_isDeclaration; }
 
     Type *Struct::index(int index)
     {
-        return std::get<1>(m_members[index]);
+        return std::get<1>(m_members.at(index));
     }
 
     std::string Struct::indexName(int index)
     {
-        return std::get<0>(m_members[index]);
+        return std::get<0>(m_members.at(index));
     }
 
     Type::Kind Struct::kind() const { return Type::Kind::Struct; }
 
     int Struct::size()
     {
-        int lastOffset = m_offsets.back();
-        auto [lastFieldName, lastFieldType] = m_members.back();
-        if (lastFieldType->isDeclaration())
-        {
-            lastFieldType = Type::fromName(lastFieldType->name());
-            if (!lastFieldType)
-            {
-                ENV_DEBUG(dbgs() << "Struct::size failed to find definition of: " << lastFieldType->name() << "\n");
-                assert(false);
-            }
-            m_members.pop_back();
-            m_members.push_back(std::make_tuple(lastFieldName, lastFieldType));
-        }
-        return lastOffset + lastFieldType->size();
+        // int lastOffset = m_offsets.back();
+        // auto [lastFieldName, lastFieldType] = m_members.back();
+        // if (lastFieldType->isDeclaration())
+        // {
+        //     lastFieldType = Type::fromName(lastFieldType->name());
+        //     if (!lastFieldType)
+        //     {
+        //         ENV_DEBUG(dbgs() << "Struct::size failed to find definition of: " << lastFieldType->name() << "\n");
+        //         assert(false);
+        //     }
+        //     // m_members.pop_back();
+        //     // m_members.push_back(std::make_tuple(lastFieldName, lastFieldType));
+        // }
+        // return lastOffset + lastFieldType->size();
+        return m_size;
     }
 
     nlohmann::json Struct::toJson() const

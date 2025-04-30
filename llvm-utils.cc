@@ -67,8 +67,14 @@ std::string getDITypeString(llvm::DIType *ty)
         res = ty->getName().str();
         break;
     }
-    case llvm::dwarf::DW_TAG_volatile_type:
     case llvm::dwarf::DW_TAG_rvalue_reference_type:
+    case llvm::dwarf::DW_TAG_reference_type:
+    {
+        auto derived = llvm::dyn_cast<llvm::DIDerivedType>(ty);
+        res = "&" + getDITypeString(derived->getBaseType());
+        break;
+    }
+    case llvm::dwarf::DW_TAG_volatile_type:
     {
         auto derived = llvm::dyn_cast<llvm::DIDerivedType>(ty);
         res = getDITypeString(derived->getBaseType());
@@ -127,12 +133,6 @@ std::string getDITypeString(llvm::DIType *ty)
         }
         break;
     }
-    case llvm::dwarf::DW_TAG_reference_type:
-    {
-        auto derived = llvm::dyn_cast<llvm::DIDerivedType>(ty);
-        res = "ref " + getDITypeString(derived->getBaseType());
-        break;
-    }
     case llvm::dwarf::DW_TAG_union_type:
     {
         auto derived = llvm::dyn_cast<llvm::DICompositeType>(ty);
@@ -158,7 +158,7 @@ std::string canonicalizeTypedefDIType(llvm::DIType *&ty)
     {
         if (auto *DITy = llvm::dyn_cast<llvm::DIDerivedType>(ty))
         {
-            if (DITy->getTag() == llvm::dwarf::DW_TAG_typedef || DITy->getTag() == llvm::dwarf::DW_TAG_const_type || DITy->getTag() == llvm::dwarf::DW_TAG_member || DITy->getTag() == llvm::dwarf::DW_TAG_volatile_type || DITy->getTag() == llvm::dwarf::DW_TAG_rvalue_reference_type || DITy->getTag() == llvm::dwarf::DW_TAG_inheritance || DITy->getTag() == llvm::dwarf::DW_TAG_atomic_type)
+            if (DITy->getTag() == llvm::dwarf::DW_TAG_typedef || DITy->getTag() == llvm::dwarf::DW_TAG_const_type || DITy->getTag() == llvm::dwarf::DW_TAG_member || DITy->getTag() == llvm::dwarf::DW_TAG_volatile_type || DITy->getTag() == llvm::dwarf::DW_TAG_inheritance || DITy->getTag() == llvm::dwarf::DW_TAG_atomic_type || DITy->getTag() == llvm::dwarf::DW_TAG_restrict_type)
             {
                 if (DITy->getTag() == llvm::dwarf::DW_TAG_typedef)
                 {
@@ -181,14 +181,12 @@ std::string canonicalizeTypedefDIType(llvm::DIType *&ty)
 
 std::string pruneStructName(const std::string &structName)
 {
-    ENV_DEBUG(errs() << "pruneStructName: " << structName << "\n");
     std::regex pattern(R"((?:class|struct|union)?\.?(?:.*?::)?([^:\.]+)(?:\.|$))");
 
     std::smatch matches;
     if (std::regex_search(structName, matches, pattern))
     {
         std::string temp = matches[1].str();
-        ENV_DEBUG(errs() << "pruneStructName after regex: " << temp << "\n");
         if (temp.find("<") != std::string::npos)
         {
             return temp.substr(0, temp.find("<"));

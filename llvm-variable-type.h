@@ -60,8 +60,10 @@ namespace pingu
         static Type *fromDIType(llvm::DIType *diType);
         static Type *fromTypeID(Type *type);
         static std::vector<Type *> &declareTypes();
+        static bool isFromType(Type *type);
+        static bool isFromDIType(Type *type);
 
-        virtual Type *interpreteAs(Type *other, std::vector<Member> &memberRefs);
+        virtual Type *interpreteAs(Type *other, std::vector<Member> &memberRefs, std::string &loadValueName);
         virtual nlohmann::json toJson() const = 0;
         virtual std::string toString() const = 0;
         virtual nlohmann::json toDebugJson() const;
@@ -102,14 +104,14 @@ namespace pingu
         int offsetIndex(int offset) const;
 
         virtual Type *index(int index) = 0;
-        Type *index(Type *targetField, int width, int offset, std::vector<Member> &memberRefs, std::string &gepValueName);
+        Type *index(int width, int offset, std::vector<Member> &memberRefs, std::string &gepValueName, Type *targetField = nullptr);
         virtual Type *replaceIndex(int index, Type *newType);
         IndexedType *indexIndexable(int idx);
         virtual std::string indexName(int index) = 0;
         bool isIndexable() const override;
 
         Type *indexAs(Type *other, int idx, std::vector<Member> &memberRefs, std::string &gepValueName, std::optional<Type *> bitfield = std::nullopt);
-        Type *interpreteAs(Type *other, std::vector<Member> &memberRefs) override;
+        Type *interpreteAs(Type *other, std::vector<Member> &memberRefs, std::string &loadValueName) override;
 
     protected:
         int m_count;
@@ -249,7 +251,6 @@ namespace pingu
     {
     public:
         Union(std::string name, const std::vector<std::tuple<std::string, Type *>> &members);
-
         Union(llvm::DICompositeType *diCT);
 
         std::string name() const;
