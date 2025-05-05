@@ -932,7 +932,6 @@ namespace pingu
         assert(diCT->getTag() == llvm::dwarf::DW_TAG_structure_type || diCT->getTag() == llvm::dwarf::DW_TAG_class_type);
         m_name = diCT->getName();
         m_size = diCT->getSizeInBits(); // getSizeInBits() may return the wrong size
-        int size = 0;
         if (isDeclaration)
         {
             // m_size = diCT->getSizeInBits();
