@@ -554,7 +554,8 @@ namespace pingu
         auto M = GEP->getParent()->getParent()->getParent();
         auto gepSrcType = Type::fromType(M, GEP->getSourceElementType());
         ENV_DEBUG(dbgs() << "resolveGEP parent: " << parent->type->toString() << "\n");
-        auto resolvedType = static_cast<Pointer *>(parent->type)->pointee();
+        auto parentPtrType = dynamic_cast<Pointer *>(parent->type);
+        auto resolvedType = parentPtrType ? parentPtrType->pointee() : parent->type;
         if (resolvedType->isDeclaration() || Type::isFromType(resolvedType))
         {
             std::string name = resolvedType->name();
@@ -682,7 +683,7 @@ namespace pingu
             }
         }
 
-        parent->type = static_cast<Pointer *>(parent->type)->pointee();
+        parent->type = parentPtrType ? parentPtrType->pointee() : parent->type;
         auto field = join(*parent, memberRefs);
         if (field)
         {

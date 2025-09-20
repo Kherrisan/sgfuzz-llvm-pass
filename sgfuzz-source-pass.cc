@@ -491,6 +491,10 @@ bool SGFuzzPass::instrument(vector<VariableInfo> &funcVarInfoList, Module &M, Fu
     {
         // Create call to sgfuzz_instrument_fn
         llvm::IRBuilder Builder(pp.ins);
+        if (pp.V->getType()->isIntegerTy(64)) {
+            // force to i32
+            pp.V = Builder.CreateTrunc(pp.V, Builder.getInt32Ty());
+        }
         Value *args[] = {
             Builder.getInt32(pp.id), // id
             pp.V                     // value
