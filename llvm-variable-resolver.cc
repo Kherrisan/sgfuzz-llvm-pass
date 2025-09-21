@@ -445,18 +445,18 @@ namespace pingu
         auto GEPSrcType = Type::fromType(M, GEP->getSourceElementType());
         ENV_DEBUG(dbgs() << "GEPSrcType: " << GEPSrcType->toString() << "\n");
 
-        VarInfo parentPointee = *parent;
-        parentPointee.type = static_cast<Pointer *>(parent->type)->pointee();
-        if (parentPointee.type->isDeclaration())
-        {
-            auto name = parentPointee.type->name();
-            parentPointee.type = Type::fromName(name);
-            if (!parentPointee.type)
-            {
-                ENV_DEBUG(dbgs() << "Failed to find definition of: '" << name << "'\n");
-                return std::nullopt;
-            }
-        }
+        // VarInfo parentPointee = *parent;
+        // parentPointee.type = static_cast<Pointer *>(parent->type)->pointee();
+        // if (parentPointee.type->isDeclaration())
+        // {
+        //     auto name = parentPointee.type->name();
+        //     parentPointee.type = Type::fromName(name);
+        //     if (!parentPointee.type)
+        //     {
+        //         ENV_DEBUG(dbgs() << "Failed to find definition of: '" << name << "'\n");
+        //         return std::nullopt;
+        //     }
+        // }
 
         int offset = 0;
 
