@@ -242,7 +242,7 @@ namespace pingu
                 }
                 else if (auto *DI = llvm::dyn_cast<llvm::DbgDeclareInst>(&I))
                 {
-                    if (auto *AI = dyn_cast<llvm::AllocaInst>(DI->getAddress()))
+                    if (auto *AI = llvm::dyn_cast<llvm::AllocaInst>(DI->getAddress()))
                     {
                         VarInfo info;
                         info.name = DI->getVariable()->getName().str();
@@ -554,7 +554,7 @@ namespace pingu
         auto M = GEP->getParent()->getParent()->getParent();
         auto gepSrcType = Type::fromType(M, GEP->getSourceElementType());
         ENV_DEBUG(dbgs() << "resolveGEP parent: " << parent->type->toString() << "\n");
-        auto parentPtrType = dynamic_cast<Pointer *>(parent->type);
+        Pointer * parentPtrType = pingu::dyn_cast<Pointer>(parent->type);
         auto resolvedType = parentPtrType ? parentPtrType->pointee() : parent->type;
         if (resolvedType->isDeclaration() || Type::isFromType(resolvedType))
         {

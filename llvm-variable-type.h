@@ -300,4 +300,15 @@ namespace pingu
     private:
         std::string m_name;
     };
+
+    template <class To, class From>
+    To *dyn_cast(From *from) {
+        if (!from) {
+            return nullptr;
+        }
+        if (from->kind() == To().kind()) {
+            return static_cast<To *>(from);
+        }
+        return nullptr;
+    }
 }
