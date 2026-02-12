@@ -374,7 +374,10 @@ namespace pingu
             {
                 auto indexedType = static_cast<IndexedType *>(field);
                 int lastIdx = indexedType->count() - 1;
-                fieldWidth = indexedType->offset(lastIdx) + indexedType->index(lastIdx)->size();
+                if (lastIdx > 0)
+                {
+                    fieldWidth = indexedType->offset(lastIdx) + indexedType->index(lastIdx)->size();
+                }
             }
             auto fieldName = indexName(i);
             ENV_DEBUG(dbgs() << "index fieldName: " << fieldName << ", fieldOffset: " << fieldOffset << ", fieldWidth: " << fieldWidth << "\n");
