@@ -315,13 +315,21 @@ namespace pingu
 
     int IndexedType::count() const { return m_count; }
 
-    int IndexedType::offset(int index) const { return m_offsets.at(index); }
+    int IndexedType::offset(int index) const
+    {
+        if (index < 0 || index >= static_cast<int>(m_offsets.size()))
+        {
+            return -1;
+        }
+        return m_offsets[index];
+    }
 
     int IndexedType::offsetIndex(int offset) const
     {
-        for (int i = m_count - 1; i >= 0; i--)
+        int limit = std::min(m_count, static_cast<int>(m_offsets.size()));
+        for (int i = limit - 1; i >= 0; i--)
         {
-            if (m_offsets.at(i) <= offset)
+            if (m_offsets[i] <= offset)
             {
                 return i;
             }
@@ -374,9 +382,14 @@ namespace pingu
             {
                 auto indexedType = static_cast<IndexedType *>(field);
                 int lastIdx = indexedType->count() - 1;
-                if (lastIdx > 0)
+                if (lastIdx >= 0)
                 {
-                    fieldWidth = indexedType->offset(lastIdx) + indexedType->index(lastIdx)->size();
+                    auto lastField = indexedType->index(lastIdx);
+                    auto lastOffset = indexedType->offset(lastIdx);
+                    if (lastField && lastOffset >= 0)
+                    {
+                        fieldWidth = lastOffset + lastField->size();
+                    }
                 }
             }
             auto fieldName = indexName(i);
@@ -468,6 +481,11 @@ namespace pingu
         }
         auto indexable = static_cast<IndexedType *>(other);
         assert(indexable);
+        if (idx < 0 || idx >= indexable->count())
+        {
+            ENV_DEBUG(dbgs() << "[!] indexAs idx out of range: " << idx << ", count: " << indexable->count() << "\n");
+            return nullptr;
+        }
         auto targetField = indexable->index(idx);
         if (!targetField)
         {
@@ -475,6 +493,11 @@ namespace pingu
             return nullptr;
         }
         auto targetOffset = indexable->offset(idx);
+        if (targetOffset < 0)
+        {
+            ENV_DEBUG(dbgs() << "[!] indexAs invalid targetOffset for idx: " << idx << "\n");
+            return nullptr;
+        }
         auto targetWidth = targetField->size();
         // TODO: remove this check ?
         if (targetOffset == 0 && targetWidth == size())
@@ -991,8 +1014,12 @@ namespace pingu
 
     Type *Struct::replaceIndex(int index, Type *newType)
     {
-        auto oldType = std::get<1>(m_members.at(index));
-        std::get<1>(m_members.at(index)) = newType;
+        if (index < 0 || index >= static_cast<int>(m_members.size()))
+        {
+            return nullptr;
+        }
+        auto oldType = std::get<1>(m_members[index]);
+        std::get<1>(m_members[index]) = newType;
         return oldType;
     }
 
@@ -1001,12 +1028,20 @@ namespace pingu
 
     Type *Struct::index(int index)
     {
-        return std::get<1>(m_members.at(index));
+        if (index < 0 || index >= static_cast<int>(m_members.size()))
+        {
+            return nullptr;
+        }
+        return std::get<1>(m_members[index]);
     }
 
     std::string Struct::indexName(int index)
     {
-        return std::get<0>(m_members.at(index));
+        if (index < 0 || index >= static_cast<int>(m_members.size()))
+        {
+            return "";
+        }
+        return std::get<0>(m_members[index]);
     }
 
     Type::Kind Struct::kind() const { return Type::Kind::Struct; }
@@ -1127,11 +1162,19 @@ namespace pingu
         m_size = diCT->getSizeInBits();
         for (const auto &member : diCT->getElements())
         {
-            auto unionMember = llvm::dyn_cast<llvm::DIDerivedType>(member);
-            assert(unionMember);
-            auto name = unionMember->getName().str();
-            auto type = Type::fromDIType(unionMember->getBaseType());
-            m_members.push_back(std::make_tuple(name, type));
+            if (auto unionMember = llvm::dyn_cast<llvm::DIDerivedType>(member))
+            {
+                auto name = unionMember->getName().str();
+                auto type = Type::fromDIType(unionMember->getBaseType());
+                m_members.push_back(std::make_tuple(name, type));
+                continue;
+            }
+
+            if (auto unionType = llvm::dyn_cast<llvm::DIType>(member))
+            {
+                auto type = Type::fromDIType(unionType);
+                m_members.push_back(std::make_tuple("", type));
+            }
         }
     }
 
