@@ -656,6 +656,26 @@ namespace pingu
                         resolvedType = typeDef;
                     }
                 }
+                if (resolvedType->kind() == Type::Kind::Union)
+                {
+                    // For union objects, continue indexing based on source element type.
+                    if (!gepSrcType->isIndexable())
+                    {
+                        dbgs() << "[!] sgfuzz-llvm-pass: gepSrcType is not indexable while resolvedType is union: '" << gepSrcType->toString() << "'\n";
+                        return std::nullopt;
+                    }
+                    auto srcIndexedType = static_cast<IndexedType *>(gepSrcType);
+                    auto srcFieldType = srcIndexedType->index(index);
+                    if (!srcFieldType)
+                    {
+                        ENV_DEBUG(dbgs() << "[!] Failed to index " << index << " in source type " << srcIndexedType->toString() << "\n");
+                        return std::nullopt;
+                    }
+                    memberRefs.push_back(std::make_tuple(srcIndexedType->indexName(index), srcFieldType));
+                    resolvedType = srcFieldType;
+                    gepSrcType = srcFieldType;
+                    continue;
+                }
                 if (!resolvedType->isIndexable())
                 {
                     dbgs() << "[!] sgfuzz-llvm-pass: Type is not indexable: '" << resolvedType->toString() << "'\n";
@@ -673,11 +693,6 @@ namespace pingu
                 if (!gepSrcType)
                 {
                     ENV_DEBUG(dbgs() << "[!] Failed to index " << index << " in " << gepSrcType->toString() << "\n");
-                    return std::nullopt;
-                }
-                if (resolvedType->kind() == Type::Kind::Union && i < GEP->getNumOperands() - 1)
-                {
-                    // union is only supported for the last index
                     return std::nullopt;
                 }
             }
